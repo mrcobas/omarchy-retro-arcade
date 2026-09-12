@@ -17,7 +17,7 @@ jobs:
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - run: REQUIRE_STOCKFISH=1 cargo test --workspace --locked --all-targets
       - run: scripts/build.sh
-      - run: ctest --test-dir build/pinball --output-on-failure -R 'theme-palette|theme-path|authored-upstream-table'
+      - run: ctest --test-dir build/pinball --output-on-failure -R 'theme-palette|theme-path|authored-upstream-table|arcade-bridge'
       - run: desktop-file-validate packaging/omarchy-retro-arcade.desktop
       - name: Render every game and collection layout
         run: |

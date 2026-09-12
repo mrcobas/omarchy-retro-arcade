@@ -90,7 +90,7 @@ int winmain::WinMain(LPCSTR lpCmdLine)
 	(
 		"Omarchy Space Cadet",
 		SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-		800, 556,
+		ArcadeBridge::Enabled() ? 1152 : 800, ArcadeBridge::Enabled() ? 790 : 556,
 		SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE
 	);
 	MainWindow = window;

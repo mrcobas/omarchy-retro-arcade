@@ -19,7 +19,9 @@ void Init(){
     fflush(stdout);output=dup(STDOUT_FILENO);dup2(STDERR_FILENO,STDOUT_FILENO);
     fcntl(STDIN_FILENO,F_SETFL,fcntl(STDIN_FILENO,F_GETFL)|O_NONBLOCK);
     signal(SIGPIPE,SIG_IGN);
-    SDL_setenv("SDL_VIDEODRIVER","dummy",1);
+    // Keep the worker windowless while allowing GPU rendering. SDL tries dummy
+    // when offscreen is unavailable; winmain retains its software renderer fallback.
+    SDL_setenv("SDL_VIDEODRIVER","offscreen,dummy",1);
 }
 static void quit(){SDL_Event e{SDL_QUIT};winmain::event_handler(&e);}
 static void command(const std::string& line){

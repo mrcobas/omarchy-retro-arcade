@@ -2,7 +2,7 @@
 
 - One repository, native window, desktop identity, Arch package and release version. Games are ordinary source subdirectories, not submodules or downloaded plugins.
 - Four Rust/egui games are library dependencies of the Arcade executable. Preserve approved rendering, gameplay and existing storage paths. Acquire each game's original session lock before opening it, flush on leaving, and drop it on returning to the shelf.
-- Circuit retains its C++ upstream engine. A private bundled worker renders through SDL software into the Arcade window. This avoids X11 window embedding and works with the same frontend on Wayland. The worker has no visible window or desktop entry. Its framed local pipes carry pixels and input, never network traffic.
+- Circuit retains its C++ upstream engine. A private bundled worker renders offscreen through SDL into the Arcade window, preferring acceleration and retaining software fallback. This avoids X11 window embedding and works with the same frontend on Wayland. The worker has no visible window or desktop entry. Its framed local pipes carry pixels and input, never network traffic.
 - Existing per-game save directories and artwork choices remain authoritative. No bulk move or conversion risks existing saves. Circuit retains high scores/settings; like its source version it does not restore unfinished games.
 - Shared navigation is Ctrl+H / Back to Arcade. Existing game shortcuts remain available. Leaving Circuit explicitly confirms ending the current table.
 - Source repositories and open PRs remain intact until the consolidation is accepted. Imported Git history and source hashes make every migration traceable.
@@ -34,3 +34,8 @@
 - The new cabinet image is decorative only. Boards, collision boundaries, pieces, projectiles, scores and buttons remain real native drawing and interactive widgets. Theme-aware light surfaces use a quiet engraved treatment instead of placing light-theme text over a dark bitmap.
 - The approved Pinball table, Invaders sprites, Chess pieces and Solitaire deck remain authoritative. Their artwork is not replaced. A new asset and its provenance live under `shared/presentation/assets`.
 - Pinball screenshot capture now waits for a rendered frame rather than capturing its loading spinner. Automated X11 rendering and input evidence remain distinct from hands-on Omarchy/Wayland acceptance.
+
+## Circuit embedded rendering
+
+- Prefer SDL offscreen video with dummy video as an availability fallback; the worker remains invisible and sends the same bounded 1152×790 RGBA frames to the Rust host. Do not force `-sw` from the host: accelerated rendering fixes missing artwork and excessive CPU use observed with SDL2-compat/SDL3 software rendering on an Omarchy tablet. The existing renderer fallback and explicit standalone `-sw` option remain available.
+- Create the bridge window at its final transport size before creating the renderer. Some offscreen renderers retain the original drawable dimensions after a hidden-window resize, clipping an otherwise correctly sized frame. Physics, artwork and save formats are unchanged.

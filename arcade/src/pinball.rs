@@ -98,7 +98,7 @@ impl Pinball {
     }
     pub fn new(ctx: &egui::Context) -> io::Result<Self> {
         let mut child = Command::new(helper()?)
-            .args(["--arcade-bridge", "--omarchy-table", "-sw"])
+            .args(["--arcade-bridge", "--omarchy-table"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
