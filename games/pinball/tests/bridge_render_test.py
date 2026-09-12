@@ -43,21 +43,20 @@ with tempfile.TemporaryDirectory() as tmp:
                 assert struct.unpack("<II", header[4:]) == (1152, 790)
                 pixels = read_exact(1152 * 790 * 4)
 
-            if not software:
-                # The static upper playfield and right cabinet are absent in the
-                # broken software render or clipped by an 800x556 drawable.
-                for x0, y0, x1, y1 in [(170, 70, 650, 240), (820, 80, 1100, 280)]:
-                    visible = 0
-                    for y in range(y0, y1, 4):
-                        for x in range(x0, x1, 4):
-                            offset = (y * 1152 + x) * 4
-                            visible += max(pixels[offset:offset + 3]) > 60
-                    assert visible > 500, "Circuit artwork is missing or clipped"
+            # The static upper playfield and right cabinet are absent in the
+            # broken software render or clipped by an 800x556 drawable.
+            for x0, y0, x1, y1 in [(170, 70, 650, 240), (820, 80, 1100, 280)]:
+                visible = 0
+                for y in range(y0, y1, 4):
+                    for x in range(x0, x1, 4):
+                        offset = (y * 1152 + x) * 4
+                        visible += max(pixels[offset:offset + 3]) > 60
+                assert visible > 500, "Circuit artwork is missing or clipped"
 
-            output, _ = process.communicate(b"quit\n", timeout=10)
+            process.communicate(b"quit\n", timeout=10)
             assert process.returncode == 0, "Bridge did not shut down cleanly"
             print("Circuit bridge: complete frames, " +
-                  ("explicit software transport" if software else "visible full-size artwork") +
+                  ("software artwork" if software else "visible full-size artwork") +
                   ", graceful quit")
         except BaseException:
             log.seek(0)

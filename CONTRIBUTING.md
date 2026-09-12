@@ -41,6 +41,8 @@ ctest --test-dir build/pinball --output-on-failure -R 'theme-palette|theme-path|
 desktop-file-validate packaging/omarchy-retro-arcade.desktop
 ```
 
+On a slower machine, set `OMARCHY_PHYSICS_TEST_TIMEOUT=300` for the CTest command to allow the full software-rendered physics simulation more time. The default remains 90 seconds per scenario; this does not change the simulation or its assertions.
+
 `REQUIRE_STOCKFISH=1` requires a working Stockfish engine; a skipped engine test is not evidence that computer Chess works. See the [CI workflow](.github/workflows/arcade.yml) for native dependencies, game switching, save checks and render commands. On Arch, `packaging/build-arch.sh` builds from a clean committed checkout and does not install the result.
 
 Check the affected behaviour in the running app, including returning to the collection. For changes to gameplay, storage or lifecycle, verify relevant pause/resume, close/reopen and save compatibility paths. For presentation changes, include actual screenshots and check light/dark themes, compact windows and 200% scale where relevant. Packaging changes need installation and upgrade/save evidence.

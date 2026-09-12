@@ -17,7 +17,8 @@ def run(shot=None):
         if shot:
             env["OMARCHY_TEST_SHOT"] = shot
         result = subprocess.run([executable, "--omarchy-table", "-sw"],
-                                env=env, capture_output=True, text=True, timeout=90)
+                                env=env, capture_output=True, text=True,
+                                timeout=float(os.environ.get("OMARCHY_PHYSICS_TEST_TIMEOUT", "90")))
         assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
         match = re.search(r"UPSTREAM_TABLE ticks=(\d+) score=(\d+) balls=(\d+) ramps=(\d+) orbits=(\d+) targets=(\d+)", result.stdout)
         assert match, result.stdout[-4000:]
