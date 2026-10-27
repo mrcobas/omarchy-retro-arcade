@@ -193,6 +193,53 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
+      - name: Deny the two public roots before any Arch package download
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_ACTIONS:-}" = true
+          test "${RUNNER_ENVIRONMENT:-}" = github-hosted
+          test "$(id -u)" = 0
+          test -f /etc/arch-release
+          command -v update-ca-trust >/dev/null
+          # Offline, exact public-root deny in this disposable container, before pacman networking.
+          arcade_trust_tmp="$RUNNER_TEMP/arcade-arch-native-deny"
+          mkdir -p "$arcade_trust_tmp"
+          printf '%s' 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNUakNDQWRPZ0F3SUJBZ0lLUFBZSHFXaHdEdHFMaERBS0JnZ3Foa2pPUFFRREF6QnJNUXN3Q1FZRFZRUUcKRXdKSlRqRVRNQkVHQTFVRUN4TUtaVzFUYVdkdUlGQkxTVEVsTUNNR0ExVUVDaE1jWlUxMVpHaHlZU0JVWldObwpibTlzYjJkcFpYTWdUR2x0YVhSbFpERWdNQjRHQTFVRUF4TVhaVzFUYVdkdUlFVkRReUJTYjI5MElFTkJJQzBnClJ6TXdIaGNOTVRnd01qRTRNVGd6TURBd1doY05ORE13TWpFNE1UZ3pNREF3V2pCck1Rc3dDUVlEVlFRR0V3SkoKVGpFVE1CRUdBMVVFQ3hNS1pXMVRhV2R1SUZCTFNURWxNQ01HQTFVRUNoTWNaVTExWkdoeVlTQlVaV05vYm05cwpiMmRwWlhNZ1RHbHRhWFJsWkRFZ01CNEdBMVVFQXhNWFpXMVRhV2R1SUVWRFF5QlNiMjkwSUVOQklDMGdSek13CmRqQVFCZ2NxaGtqT1BRSUJCZ1VyZ1FRQUlnTmlBQVFqcFF5NExSTDFLUE94c3QzaUFoS0FuamxmU1UyZnlTVTAKV1hUc3V3WWM1OEJ5citpdUwrRkJWSWNVcUVxeTZIeUM1bHRxdGR5emRjNkxCdENHSTc5RzFZNFBQd1QwMXh5UwpmdmFsWThMMVg0NHVUNkVZR1FJck1ncUNaSDBXazlHalFqQkFNQjBHQTFVZERnUVdCQlI4WFFLRUU5VE1pcHVCCnpoY2NMaWtlbkVoalFqQU9CZ05WSFE4QkFmOEVCQU1DQVFZd0R3WURWUjBUQVFIL0JBVXdBd0VCL3pBS0JnZ3EKaGtqT1BRUURBd05wQURCbUFqRUF2dk5oendJUUhXU1ZCN2dZYm9pRkJTK0RDQmVReWgrS1RPZ05HM3F4cmRXQgpDVWZ2TzZ3SUJIeGNtYkh0UndmU0FqRUFuYnBWL0tsSzZPM3Q1bllCUW52SStHRFpqVkdMVlR2N2pIdnJaUW5ECitKYk5SNmlDOGhaVmR5UitFaENWQkN5agotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==' | base64 --decode > "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem"
+          arcade_der_sha=$(openssl x509 -in "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem" -outform DER | sha256sum)
+          test "${arcade_der_sha%% *}" = '86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b'
+          install -D -m 0644 "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem" '/etc/ca-certificates/trust-source/blocklist/cobas-86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem'
+          printf 'arch_native_deny public_root_sha256=%s\n' '86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b'
+          printf '%s' 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVNakNDQXhxZ0F3SUJBZ0lCQVRBTkJna3Foa2lHOXcwQkFRVUZBREI3TVFzd0NRWURWUVFHRXdKSFFqRWIKTUJrR0ExVUVDQXdTUjNKbFlYUmxjaUJOWVc1amFHVnpkR1Z5TVJBd0RnWURWUVFIREFkVFlXeG1iM0prTVJvdwpHQVlEVlFRS0RCRkRiMjF2Wkc4Z1EwRWdUR2x0YVhSbFpERWhNQjhHQTFVRUF3d1lRVUZCSUVObGNuUnBabWxqCllYUmxJRk5sY25acFkyVnpNQjRYRFRBME1ERXdNVEF3TURBd01Gb1hEVEk0TVRJek1USXpOVGsxT1Zvd2V6RUwKTUFrR0ExVUVCaE1DUjBJeEd6QVpCZ05WQkFnTUVrZHlaV0YwWlhJZ1RXRnVZMmhsYzNSbGNqRVFNQTRHQTFVRQpCd3dIVTJGc1ptOXlaREVhTUJnR0ExVUVDZ3dSUTI5dGIyUnZJRU5CSUV4cGJXbDBaV1F4SVRBZkJnTlZCQU1NCkdFRkJRU0JEWlhKMGFXWnBZMkYwWlNCVFpYSjJhV05sY3pDQ0FTSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnRVAKQURDQ0FRb0NnZ0VCQUw1QW5mUnU0ZXAyaHh4TlJVU092a2JJZ3dhZHdTcitHQitPNUFMNjg2dGRVSW9XTVF1YQpCdERGY0NMTlNTMVVZOHkyYm1oR0MxUHF5MHdrd0x4eVR1cnhGYTcwVkpvU0NzTjZzak5nNHRxSlZmTWlXUFBlCjNNL3ZnNGFpakpSUG4yanltSkJHaENmSGRyL2p6RFVzaTE0SFpHV0N3RWl3cUpINVlaOTJJRkNva2NkbXRldDQKWWdOVzhJb2FFK294b3g2Z21mMDQ5dlluTWxodkIvVnJ1UHNVSzYrM3FzeldZMTl6ak5vRm1hZzRxTXNYZURaUgpyT21lOUhnNmpjOFAyVUxpbUF5ckw1OE9BZDd2bjVsSjhTM2ZySFJORzVpMVI4WGxLZEg1a0JqSFlweStnOGNtCmV6NktKY2ZBM1ozbU5XZ1FJSjJQMk43U3c0U2NEVjdvTDhrQ0F3RUFBYU9Cd0RDQnZUQWRCZ05WSFE0RUZnUVUKb0JFS0l6Nlc4UWZzNHE4cDc0S2xmOUF3cExRd0RnWURWUjBQQVFIL0JBUURBZ0VHTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d2V3WURWUjBmQkhRd2NqQTRvRGFnTklZeWFIUjBjRG92TDJOeWJDNWpiMjF2Wkc5allTNWpiMjB2ClFVRkJRMlZ5ZEdsbWFXTmhkR1ZUWlhKMmFXTmxjeTVqY213d05xQTBvREtHTUdoMGRIQTZMeTlqY213dVkyOXQKYjJSdkxtNWxkQzlCUVVGRFpYSjBhV1pwWTJGMFpWTmxjblpwWTJWekxtTnliREFOQmdrcWhraUc5dzBCQVFVRgpBQU9DQVFFQUNGYjhBdkNiNlArayt0Wjd4a1NBemsvRXhmWUFXTXltdHJ3VVNXZ0VkdWptN2wzc0FnOWcxbzFRCkdFOG1UZ0hqNXJDbDdyKzhkRlJCdi8zOEVyakhUMXIwaVdBRmYyQzNCVXJ6OXZIQ3Y4UzVkSWEyTFgxcnpOTHoKUnQwdnh1QnF3OE0wQXl4OWx0MWF3ZzZuQ3BuQkJZdXJEQy96WERyUGJEZFZDWWZlVTBCc1dPLzh0cXRsYmdUMgpHOXc4NEZvVnhwN1o4VmxJTUNGbEEyenM2U0Z6N0pzRG9lQTNyYUFWR0kvNnVnTE9weXlwRUJNczFPVUlKcXNpCmwyRDRrRjUwMUtLYVU3M3lxV2pnb203QzEyeXhvdytldit0bzUxYnlydkxqS3pnNkNZRzFhNFhYdmkzdFB4cTMKc21QaTlXSXNndFJxQUVGUThUbURuNVhwTnBhWWJnPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=' | base64 --decode > "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem"
+          arcade_der_sha=$(openssl x509 -in "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem" -outform DER | sha256sum)
+          test "${arcade_der_sha%% *}" = 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'
+          install -D -m 0644 "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem" '/etc/ca-certificates/trust-source/blocklist/cobas-d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem'
+          printf 'arch_native_deny public_root_sha256=%s\n' 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'
+          update-ca-trust extract
+          # Native curl must now reject every fixture before package index/package downloads.
+          for arcade_chain in g3b g3c g3b-aaa g3c-aaa; do
+            for arcade_kind in dv ov ev; do
+              arcade_host="$arcade_kind-$arcade_chain-emudhra.we-have-a-problem.com"
+              if curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$arcade_host/" 2>/dev/null; then
+                printf 'arch_native_tls host=%s result=accepted_tls\n' "$arcade_host"; exit 1
+              else
+                arcade_curl_exit=$?; test "$arcade_curl_exit" -eq 60
+                printf 'arch_native_tls host=%s result=rejected_certificate\n' "$arcade_host"
+              fi
+            done
+          done
+          for arcade_host in dv-g3b-noct-emudhra.we-have-a-problem.com dv-g3b-aaa-noct-emudhra.we-have-a-problem.com; do
+            if curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$arcade_host/" 2>/dev/null; then
+              printf 'arch_native_tls host=%s result=accepted_tls\n' "$arcade_host"; exit 1
+            else
+              arcade_curl_exit=$?; test "$arcade_curl_exit" -eq 60
+              printf 'arch_native_tls host=%s result=rejected_certificate\n' "$arcade_host"
+            fi
+          done
+          for arcade_host in github.com geo.mirror.pkgbuild.com; do
+            curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$arcade_host/"
+            printf 'arch_native_tls host=%s result=accepted_tls\n' "$arcade_host"
+          done
       - run: pacman -Syu --noconfirm git rust cmake python sdl2 sdl2_image sdl2_mixer libglvnd libx11 libxcursor libxi libxrandr libxkbcommon libxkbcommon-x11 libxtst wayland dbus mesa python-pillow libpulse xdg-desktop-portal xorg-server-xvfb xorg-xauth
       - name: Prepare scoped CI certificate trust before actions
         shell: bash
