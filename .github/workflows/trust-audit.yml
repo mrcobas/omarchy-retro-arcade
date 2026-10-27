@@ -106,11 +106,13 @@ jobs:
           # Remove only the two public trust anchors covering the compromised emSign chains.
           # Preserve every other anchor. An empty directory prevents OpenSSL capath fallback.
           out = pathlib.Path(os.environ['RUNNER_TEMP'])/'cobas-ci-trust'
-          out.mkdir(mode=0o700,parents=True,exist_ok=True)
-          empty = out/'empty'; empty.mkdir(exist_ok=True)
+          out.mkdir(mode=0o755,parents=True,exist_ok=True)
+          os.chmod(out,0o755)
+          empty = out/'empty'; empty.mkdir(exist_ok=True); os.chmod(empty,0o755)
           bundle = out/'roots.pem'
           kept = {h:c for h,c in roots.items() if h not in bad}
           bundle.write_text(''.join(ssl.DER_cert_to_PEM_cert(c) for c in kept.values()))
+          os.chmod(bundle,0o644)
           assert set(roots)-set(kept) <= bad and not (set(kept)&bad)
           settings = {k:str(bundle) for k in ['SSL_CERT_FILE','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT']}
           settings['SSL_CERT_DIR']=str(empty)
@@ -124,6 +126,26 @@ jobs:
           protected_env={**raw_env,**settings,'NODE_OPTIONS':'--use-openssl-ca'}
           protected=ssl.create_default_context(cafile=str(bundle),capath=str(empty))
           print(json.dumps({'phase':'scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'actual_action_node':str(node) if node else None,'provider_boundary':'Runner .NET action downloads and host container pulls happen outside this shell; this does not attest them.'},sort_keys=True),flush=True)
+          # Preserve curl verification even when an owned caller passes --disable/-q.
+          # Flags precede the caller's -- URL separator; no credentials are put in this wrapper.
+          import shutil,shlex
+          real_curl=shutil.which('curl');assert real_curl and pathlib.Path(real_curl).resolve().is_file()
+          bin_dir=out/'bin';bin_dir.mkdir(mode=0o755,exist_ok=True);os.chmod(bin_dir,0o755)
+          wrapper=bin_dir/'curl'
+          wrapper.write_text('#!/bin/sh\nexec '+shlex.quote(real_curl)+' --cacert '+shlex.quote(str(bundle))+' --capath '+shlex.quote(str(empty))+' "$@"\n')
+          os.chmod(wrapper,0o755)
+          with open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(bin_dir)+'\n')
+          protected_env['PATH']=str(bin_dir)+os.pathsep+protected_env['PATH']
+          # Arch makepkg uses an absolute /usr/bin/curl agent. Preserve its full configuration
+          # and agent flags while replacing only the curl executable in a per-job config.
+          makepkg=pathlib.Path('/etc/makepkg.conf')
+          if makepkg.is_file():
+              config=out/'makepkg.conf'
+              text=makepkg.read_text()
+              assert '/usr/bin/curl' in text, 'Unexpected makepkg agent configuration'
+              config.write_text(text.replace('/usr/bin/curl',str(wrapper)))
+              os.chmod(config,0o644)
+              settings['MAKEPKG_CONF']=str(config)
           if probe:
               py=python_probes(protected); nd=node_probes(protected_env); cu=curl_probes(protected_env)
               print(json.dumps({'phase':'scoped_runtime_acceptance','python_tls':py,'action_node':nd,'curl_tls':cu},sort_keys=True),flush=True)
@@ -308,11 +330,13 @@ jobs:
           # Remove only the two public trust anchors covering the compromised emSign chains.
           # Preserve every other anchor. An empty directory prevents OpenSSL capath fallback.
           out = pathlib.Path(os.environ['RUNNER_TEMP'])/'cobas-ci-trust'
-          out.mkdir(mode=0o700,parents=True,exist_ok=True)
-          empty = out/'empty'; empty.mkdir(exist_ok=True)
+          out.mkdir(mode=0o755,parents=True,exist_ok=True)
+          os.chmod(out,0o755)
+          empty = out/'empty'; empty.mkdir(exist_ok=True); os.chmod(empty,0o755)
           bundle = out/'roots.pem'
           kept = {h:c for h,c in roots.items() if h not in bad}
           bundle.write_text(''.join(ssl.DER_cert_to_PEM_cert(c) for c in kept.values()))
+          os.chmod(bundle,0o644)
           assert set(roots)-set(kept) <= bad and not (set(kept)&bad)
           settings = {k:str(bundle) for k in ['SSL_CERT_FILE','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT']}
           settings['SSL_CERT_DIR']=str(empty)
@@ -326,6 +350,26 @@ jobs:
           protected_env={**raw_env,**settings,'NODE_OPTIONS':'--use-openssl-ca'}
           protected=ssl.create_default_context(cafile=str(bundle),capath=str(empty))
           print(json.dumps({'phase':'scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'actual_action_node':str(node) if node else None,'provider_boundary':'Runner .NET action downloads and host container pulls happen outside this shell; this does not attest them.'},sort_keys=True),flush=True)
+          # Preserve curl verification even when an owned caller passes --disable/-q.
+          # Flags precede the caller's -- URL separator; no credentials are put in this wrapper.
+          import shutil,shlex
+          real_curl=shutil.which('curl');assert real_curl and pathlib.Path(real_curl).resolve().is_file()
+          bin_dir=out/'bin';bin_dir.mkdir(mode=0o755,exist_ok=True);os.chmod(bin_dir,0o755)
+          wrapper=bin_dir/'curl'
+          wrapper.write_text('#!/bin/sh\nexec '+shlex.quote(real_curl)+' --cacert '+shlex.quote(str(bundle))+' --capath '+shlex.quote(str(empty))+' "$@"\n')
+          os.chmod(wrapper,0o755)
+          with open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(bin_dir)+'\n')
+          protected_env['PATH']=str(bin_dir)+os.pathsep+protected_env['PATH']
+          # Arch makepkg uses an absolute /usr/bin/curl agent. Preserve its full configuration
+          # and agent flags while replacing only the curl executable in a per-job config.
+          makepkg=pathlib.Path('/etc/makepkg.conf')
+          if makepkg.is_file():
+              config=out/'makepkg.conf'
+              text=makepkg.read_text()
+              assert '/usr/bin/curl' in text, 'Unexpected makepkg agent configuration'
+              config.write_text(text.replace('/usr/bin/curl',str(wrapper)))
+              os.chmod(config,0o644)
+              settings['MAKEPKG_CONF']=str(config)
           if probe:
               py=python_probes(protected); nd=node_probes(protected_env); cu=curl_probes(protected_env)
               print(json.dumps({'phase':'scoped_runtime_acceptance','python_tls':py,'action_node':nd,'curl_tls':cu},sort_keys=True),flush=True)

@@ -20,8 +20,8 @@ for tool in ['cargo','rustup','mise']:
    env.update(RUSTUP_DIST_SERVER='https://'+host)
    args=[binary,'check','--no-self-update']
   else:
-   env.update(MISE_NODE_MIRROR_URL='https://'+host,XDG_CACHE_HOME=str(state/'cache'),MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE=str(state/'config.toml'),MISE_HTTP_TIMEOUT='10',MISE_HTTP_RETRIES='0')
-   args=[binary,'ls-remote','node']
+   env.update(MISE_NODE_MIRROR_URL='https://'+host,XDG_CACHE_HOME=str(state/'cache'),MISE_CACHE_DIR=str(state/'cache'),MISE_STATE_DIR=str(state/'state'),MISE_CONFIG_DIR=str(state/'config'),MISE_USE_VERSIONS_HOST='0',MISE_NO_SELF_UPDATE='1',MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE=str(state/'config.toml'),MISE_HTTP_TIMEOUT='10s',MISE_HTTP_RETRIES='0')
+   args=[binary,'ls-remote','--no-versions-host','node']
   try:
    r=subprocess.run(args,env=env,cwd=state,capture_output=True,text=True,timeout=25)
    return {'tool':tool,'host':host,'result':'rejected_certificate' if pattern.search(r.stderr+r.stdout) else 'not_certificate_rejection','exit':r.returncode,**({'error_excerpt':r.stderr[-500:]} if host==hosts[0] else {})}
@@ -35,7 +35,7 @@ for tool in ['cargo','rustup','mise']:
  elif tool=='rustup':
   args=[binary,'check','--no-self-update'];provider='static.rust-lang.org rustup release metadata'
  else:
-  env.update(XDG_CACHE_HOME=str(state/'cache'),MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE=str(state/'config.toml'),MISE_HTTP_TIMEOUT='15',MISE_HTTP_RETRIES='0');args=[binary,'ls-remote','node'];provider='nodejs.org release metadata'
+  env.update(XDG_CACHE_HOME=str(state/'cache'),MISE_CACHE_DIR=str(state/'cache'),MISE_STATE_DIR=str(state/'state'),MISE_CONFIG_DIR=str(state/'config'),MISE_USE_VERSIONS_HOST='0',MISE_NO_SELF_UPDATE='1',MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE=str(state/'config.toml'),MISE_HTTP_TIMEOUT='15s',MISE_HTTP_RETRIES='0');args=[binary,'ls-remote','--no-versions-host','node'];provider='nodejs.org release metadata'
  try:
   r=subprocess.run(args,env=env,cwd=state,capture_output=True,text=True,timeout=30)
   rows.append({'tool':tool,'positive_provider':provider,'result':'accepted_tls' if r.returncode in ([0,100] if tool=='rustup' else [0]) else 'provider_check_failed','exit':r.returncode,**({'error_excerpt':r.stderr[-500:]} if r.returncode not in [0,100] else {})})
