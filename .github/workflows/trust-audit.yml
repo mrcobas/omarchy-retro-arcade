@@ -1,0 +1,625 @@
+name: Qualify CI certificate trust
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_OPTIONS: --use-openssl-ca
+
+jobs:
+  trust:
+    name: Certificate trust (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ["ubuntu-latest"]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 8
+    env:
+      CI_TRUST_APT: '1'
+      CI_TRUST_PROBE: '1'
+    steps:
+      - name: Prepare scoped CI certificate trust before actions
+        shell: bash
+        run: |
+          python3 - <<'CI_TRUST_PY'
+          import base64, concurrent.futures, hashlib, json, os, pathlib, socket, ssl, subprocess, sys
+          bad = {'86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b', 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'}
+          keys = ['SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO', 'PIP_CERT', 'NODE_OPTIONS', 'CURL_HOME', 'GIT_SSL_CAPATH', 'CARGO_HTTP_CAINFO']
+          raw_env = {k:v for k,v in os.environ.items() if k not in keys}
+          for k in keys:
+              os.environ.pop(k, None)
+          paths = ssl.get_default_verify_paths()
+          raw = ssl.create_default_context()
+          roots = {hashlib.sha256(c).hexdigest():c for c in raw.get_ca_certs(binary_form=True)}
+          assert len(roots) >= 80, 'Unexpectedly small runner CA store; refusing replacement'
+          probe = os.environ.get('CI_TRUST_PROBE') == '1'
+          hosts = [f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']] + ['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          controls = ['github.com','registry.npmjs.org','pypi.org','files.pythonhosted.org']
+          def tls(host, context):
+              try:
+                  with socket.create_connection((host,443), timeout=10) as s:
+                      with context.wrap_socket(s,server_hostname=host):
+                          return {'host':host,'result':'accepted_tls'}
+              except ssl.SSLCertVerificationError:
+                  return {'host':host,'result':'rejected_certificate'}
+              except Exception as e:
+                  return {'host':host,'result':'transport_error','error_type':type(e).__name__}
+          def python_probes(context):
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  return list(pool.map(lambda h:tls(h,context),hosts+controls))
+          node_code = r"""
+          const tls=require('node:tls');
+          const hosts=JSON.parse(process.argv[1]);
+          Promise.all(hosts.map(host=>new Promise(resolve=>{
+           let done=false; const end=result=>{if(!done){done=true;resolve({host,result});s.destroy();}};
+           const s=tls.connect({host,port:443,servername:host,rejectUnauthorized:true},()=>end('accepted_tls'));
+           s.setTimeout(10000,()=>end('transport_error'));
+           s.on('error',e=>end(/CERT|ISSUER|VERIFY|SELF_SIGNED/.test(e.code||'')?'rejected_certificate':'transport_error'));
+          }))).then(rows=>console.log(JSON.stringify({node:process.version,openssl:process.versions.openssl,executable:process.execPath,rows})));
+          """
+          # Find the actual JavaScript action runtime, rather than trusting the action.yml label.
+          node_paths = []
+          for root in ['/home/runner/runners','/Users/runner/runners']:
+              node_paths += sorted(pathlib.Path(root).glob('*/externals/node24/bin/node'))
+          node_paths += [pathlib.Path('/__e/node24/bin/node'),pathlib.Path('/home/runner/actions-runner/externals/node24/bin/node')]
+          worker_executables=[]
+          for proc in pathlib.Path('/proc').glob('[0-9]*'):
+              try:
+                  if (proc/'comm').read_text().strip() in ('Runner.Worker','Runner.Listener'):
+                      executable=(proc/'exe').resolve()
+                      worker_executables.append(str(executable))
+                      node_paths.insert(0,executable.parent.parent/'externals/node24/bin/node')
+              except (OSError,PermissionError):
+                  pass
+          try:
+              for line in subprocess.check_output(['ps','-axo','comm='], text=True).splitlines():
+                  p=pathlib.Path(line.strip())
+                  if p.name == 'Runner.Worker' and p.is_absolute():
+                      node_paths.insert(0,p.parent.parent/'externals/node24/bin/node')
+          except (OSError,subprocess.CalledProcessError):
+              pass
+          node = next((p for p in node_paths if p.is_file()),None)
+          def node_probes(env):
+              if node is None:
+                  print(json.dumps({'runner_worker_executables':worker_executables,'node_candidates':[str(p) for p in node_paths]},sort_keys=True),flush=True)
+              assert node is not None, 'Actual action node24 binary was not found' 
+              return json.loads(subprocess.check_output([str(node),'-e',node_code,json.dumps(hosts+controls)],env=env,text=True,timeout=35))
+          def curl_probes(env):
+              def one(h):
+                  r=subprocess.run(['curl','--noproxy','*','--silent','--show-error','--head','--output',os.devnull,'--connect-timeout','8','--max-time','12','https://'+h+'/'],env=env,capture_output=True,text=True,timeout=15)
+                  return {'host':h,'result':'accepted_tls' if r.returncode==0 else ('rejected_certificate' if r.returncode==60 else 'transport_error'),'exit':r.returncode}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  return list(pool.map(one,hosts+controls))
+          def gate(rows):
+              assert len(rows)==18
+              assert all(r['result']=='rejected_certificate' for r in rows if r['host'] in hosts), 'Affected chain accepted or network inconclusive'
+              assert all(r['result']=='accepted_tls' for r in rows if r['host'] in controls), 'Normal TLS control failed'
+          if probe:
+              print(json.dumps({'phase':'raw_runner_before_scoped_changes','python':sys.version.split()[0],'openssl':ssl.OPENSSL_VERSION,'ca_paths':list(paths),'python_tls':python_probes(raw),'action_node':node_probes(raw_env),'curl_tls':curl_probes(raw_env)},sort_keys=True),flush=True)
+          # Remove only the two public trust anchors covering the compromised emSign chains.
+          # Preserve every other anchor. An empty directory prevents OpenSSL capath fallback.
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'cobas-ci-trust'
+          out.mkdir(mode=0o755,parents=True,exist_ok=True)
+          os.chmod(out,0o755)
+          empty = out/'empty'; empty.mkdir(exist_ok=True); os.chmod(empty,0o755)
+          bundle = out/'roots.pem'
+          kept = {h:c for h,c in roots.items() if h not in bad}
+          bundle.write_text(''.join(ssl.DER_cert_to_PEM_cert(c) for c in kept.values()))
+          os.chmod(bundle,0o644)
+          assert set(roots)-set(kept) <= bad and not (set(kept)&bad)
+          settings = {k:str(bundle) for k in ['SSL_CERT_FILE','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT']}
+          settings['SSL_CERT_DIR']=str(empty)
+          settings['GIT_SSL_CAPATH']=str(empty)
+          settings['CARGO_HTTP_CAINFO']=str(bundle)
+          # libcurl's compiled default CApath can override SSL_CERT_DIR. A job-scoped
+          # curlrc closes that fallback for normal curl calls; --disable callers are separate.
+          (out/'.curlrc').write_text('cacert = '+json.dumps(str(bundle))+'\ncapath = '+json.dumps(str(empty))+'\n')
+          settings['CURL_HOME']=str(out)
+          settings['HOMEBREW_CURLRC']=str(out/'.curlrc')
+          protected_env={**raw_env,**settings,'NODE_OPTIONS':'--use-openssl-ca'}
+          protected=ssl.create_default_context(cafile=str(bundle),capath=str(empty))
+          # APT/GnuTLS does not inherit Node/curl trust settings. Configure its supported
+          # CAInfo explicitly before owned package bootstrap; preserve package signing keys.
+          apt_helper=pathlib.Path('/usr/lib/apt/apt-helper')
+          if os.environ.get('CI_TRUST_APT') == '1' and sys.platform.startswith('linux') and apt_helper.is_file():
+              assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
+              import re,tempfile
+              apt_dir=pathlib.Path('/etc/apt/cobas-ci')
+              subprocess.run(['sudo','-n','install','-d','-m','0755',str(apt_dir)],check=True,capture_output=True,text=True,timeout=15)
+              apt_bundle=apt_dir/'roots.pem'
+              subprocess.run(['sudo','-n','install','-m','0644',str(bundle),str(apt_bundle)],check=True,capture_output=True,text=True,timeout=15)
+              assert hashlib.sha256(apt_bundle.read_bytes()).digest()==hashlib.sha256(bundle.read_bytes()).digest()
+              apt_config='Acquire::https::CAInfo '+json.dumps(str(apt_bundle))+';\nAcquire::https::Verify-Peer "true";\nAcquire::https::Verify-Host "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n'
+              subprocess.run(['sudo','-n','tee','/etc/apt/apt.conf.d/99zz-cobas-ci-trust'],input=apt_config,check=True,capture_output=True,text=True,timeout=15)
+              changed=[]
+              sources=[pathlib.Path('/etc/apt/sources.list'),pathlib.Path('/etc/apt/apt-mirrors.txt')]+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.list'))+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.sources'))
+              for source in sources:
+                  if not source.is_file():continue
+                  before=source.read_text()
+                  after=re.sub(r'https?://azure\.archive\.ubuntu\.com/ubuntu','https://archive.ubuntu.com/ubuntu',before)
+                  after=re.sub(r'http://(archive|security)\.ubuntu\.com/ubuntu',r'https://\1.ubuntu.com/ubuntu',after)
+                  if after!=before:
+                      subprocess.run(['sudo','-n','tee',str(source)],input=after,check=True,capture_output=True,text=True,timeout=15)
+                      changed.append(str(source))
+              print(json.dumps({'component':'owned_apt_https_configuration','ca_sha256':hashlib.sha256(apt_bundle.read_bytes()).hexdigest(),'verify_peer':True,'verify_host':True,'official_ubuntu_mirror_files_repaired':changed,'package_signing_keys_suites_components':'unchanged','scope':'Only this disposable GitHub-hosted job'},sort_keys=True),flush=True)
+              if probe:
+                  def apt_one(host):
+                      # The real acquire backend is used without root, auth or request bodies.
+                      # Public responses are discarded immediately; only TLS metadata remains.
+                      with tempfile.TemporaryDirectory(prefix='apt-tls-',dir=out) as scratch:
+                          target=pathlib.Path(scratch)/'discard';empty_auth=pathlib.Path(scratch)/'empty-auth';empty_auth.mkdir()
+                          uri='https://'+host+('/ubuntu/dists/noble/InRelease' if host=='archive.ubuntu.com' else '/')
+                          args=[str(apt_helper),'-o','Acquire::Retries=0','-o','Acquire::https::Timeout=8','-o','Acquire::https::Proxy=DIRECT','-o','Dir::Etc::netrc=/dev/null','-o','Dir::Etc::netrcparts='+str(empty_auth),'download-file',uri,str(target)]
+                          try:
+                              r=subprocess.run(args,capture_output=True,text=True,timeout=15)
+                              certificate=bool(re.search(r'certificate verification failed|certificate is NOT trusted|certificate issuer is unknown|error in the certificate verification',r.stderr+r.stdout,re.I))
+                              result='accepted_tls' if r.returncode==0 else ('rejected_certificate' if certificate else 'transport_error')
+                              return {'host':host,'result':result,'exit':r.returncode,**({'error_excerpt':r.stderr[-350:]} if result=='transport_error' else {})}
+                          except subprocess.TimeoutExpired:return {'host':host,'result':'transport_error','error_type':'timeout'}
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:apt_rows=list(pool.map(apt_one,hosts+['archive.ubuntu.com']))
+                  print(json.dumps({'component':'actual_apt_acquire_https','rows':apt_rows,'credentials_sent':False,'request_body_sent':False,'response_body_retained':False},sort_keys=True),flush=True)
+                  assert len(apt_rows)==15
+                  assert all(r['result']=='rejected_certificate' for r in apt_rows[:14]), 'APT TLS fixture rejection incomplete'
+                  assert apt_rows[-1]['result']=='accepted_tls', 'APT normal Ubuntu control failed'
+          print(json.dumps({'phase':'scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'actual_action_node':str(node) if node else None,'provider_boundary':'Runner .NET action downloads and host container pulls happen outside this shell; this does not attest them.'},sort_keys=True),flush=True)
+          # Preserve curl verification even when an owned caller passes --disable/-q.
+          # Flags precede the caller's -- URL separator; no credentials are put in this wrapper.
+          import shutil,shlex
+          real_curl=shutil.which('curl');assert real_curl and pathlib.Path(real_curl).resolve().is_file()
+          bin_dir=out/'bin';bin_dir.mkdir(mode=0o755,exist_ok=True);os.chmod(bin_dir,0o755)
+          wrapper=bin_dir/'curl'
+          wrapper.write_text('#!/bin/sh\nexec '+shlex.quote(real_curl)+' --cacert '+shlex.quote(str(bundle))+' --capath '+shlex.quote(str(empty))+' "$@"\n')
+          os.chmod(wrapper,0o755)
+          with open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(bin_dir)+'\n')
+          protected_env['PATH']=str(bin_dir)+os.pathsep+protected_env['PATH']
+          # Arch makepkg uses an absolute /usr/bin/curl agent. Preserve its full configuration
+          # and agent flags while replacing only the curl executable in a per-job config.
+          makepkg=pathlib.Path('/etc/makepkg.conf')
+          if makepkg.is_file():
+              config=out/'makepkg.conf'
+              text=makepkg.read_text()
+              assert '/usr/bin/curl' in text, 'Unexpected makepkg agent configuration'
+              config.write_text(text.replace('/usr/bin/curl',str(wrapper)))
+              os.chmod(config,0o644)
+              settings['MAKEPKG_CONF']=str(config)
+          if probe:
+              py=python_probes(protected); nd=node_probes(protected_env); cu=curl_probes(protected_env)
+              print(json.dumps({'phase':'scoped_runtime_acceptance','python_tls':py,'action_node':nd,'curl_tls':cu},sort_keys=True),flush=True)
+              gate(py); gate(nd['rows']); gate(cu)
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              for k,v in settings.items():
+                  f.write(f'{k}={v}\n')
+          # NODE_OPTIONS must be set directly in workflow env; GitHub forbids setting it via GITHUB_ENV.
+          CI_TRUST_PY
+
+      - name: Qualify actual pip session without changing runner packages
+        shell: bash
+        run: |
+          python3 - <<'CI_PIP_PY'
+          import hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          assert sys.version_info >= (3,10), 'Pinned pip truststore qualification requires Python >= 3.10'
+          hosts = [f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']] + ['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          controls=['pypi.org','files.pythonhosted.org']
+          code=r"""
+          import concurrent.futures, hashlib, json, sys
+          try:
+           import pip
+           from pip._vendor import certifi
+           from pip._internal.commands import create_command
+          except ImportError:
+           print(json.dumps({'installed':False})); raise SystemExit(0)
+          hosts=json.loads(sys.argv[1])
+          def one(host):
+           cmd=create_command('index',isolated=True)
+           options,args=cmd.parse_args(['--no-cache-dir','--disable-pip-version-check','--no-input','--keyring-provider','disabled','--retries','0','--timeout','10','versions','cobas-trust-probe'])
+           session=cmd._build_session(options)
+           session.trust_env=False;session.auth=None;session.proxies={}
+           try:
+            with session.head('https://'+host+'/',allow_redirects=False,timeout=10,stream=True) as r:
+             return {'host':host,'result':'accepted_tls'}
+           except Exception as e:
+            return {'host':host,'result':'rejected_certificate' if any(marker in repr(e) for marker in ('CERTIFICATE_VERIFY_FAILED','SSLCertVerificationError','SSLVerificationError','certificate is blocked')) else 'transport_error','error_type':type(e).__name__,'error':str(e)[:300]}
+           finally:session.close()
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:rows=list(pool.map(one,hosts))
+          print(json.dumps({'installed':True,'pip':pip.__version__,'vendored_ca_sha256':hashlib.sha256(open(certifi.where(),'rb').read()).hexdigest(),'session':'pip default _build_session, truststore plus vendored certifi, no auth/proxy/cache/body','rows':rows},sort_keys=True))
+          """
+          raw_env={k:v for k,v in os.environ.items() if k not in ['SSL_CERT_FILE','SSL_CERT_DIR','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT','PYTHONPATH']}
+          r=subprocess.run([sys.executable,'-c',code,json.dumps(hosts+controls)],env=raw_env,capture_output=True,text=True,timeout=45)
+          assert r.returncode==0, 'Stock pip session could not be audited: '+r.stderr[-200:]
+          print(json.dumps({'phase':'raw_provider_pip_inventory','result':json.loads(r.stdout)},sort_keys=True),flush=True)
+          # Fetch with the already-qualified stdlib verifier, verify the exact official wheel, and
+          # import it from this job's temporary wheel. No system/runner pip installation is changed.
+          url='https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl'
+          expected='fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+          wheel=pathlib.Path(os.environ['RUNNER_TEMP'])/'pip-26.2.2-py3-none-any.whl'
+          with urllib.request.urlopen(url,timeout=30) as r:data=r.read(3000000)
+          assert hashlib.sha256(data).hexdigest()==expected, 'Official pip wheel checksum mismatch'
+          wheel.write_bytes(data)
+          env={**os.environ,'PYTHONPATH':str(wheel)}
+          r=subprocess.run([sys.executable,'-c',code,json.dumps(hosts+controls)],env=env,capture_output=True,text=True,timeout=45)
+          assert r.returncode==0, 'Fixed pip session audit failed: '+r.stderr[-200:]
+          result=json.loads(r.stdout)
+          print(json.dumps({'phase':'fixed_pip_default_session_acceptance','wheel_sha256':expected,'result':result},sort_keys=True),flush=True)
+          assert result['pip']=='26.2.2'
+          assert len(result['rows'])==16
+          assert all(x['result']=='rejected_certificate' for x in result['rows'] if x['host'] in hosts)
+          assert all(x['result']=='accepted_tls' for x in result['rows'] if x['host'] in controls)
+          CI_PIP_PY
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Qualify runner CLR HTTP boundary without touching the runner
+        run: python3 .github/scripts/runner-dotnet-probe.py
+
+      - name: Verify actual Git HTTPS trust without credentials
+        run: python3 .github/scripts/ci-git-trust.py
+
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Qualify actual bootstrap downloader clients
+        run: python3 .github/scripts/ci-bootstrap-clients.py
+
+  arch-trust:
+    name: Certificate trust (Arch container)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 10
+    env:
+      CI_TRUST_PROBE: '1'
+    steps:
+      - name: Record raw container TLS before signed package bootstrap
+        shell: bash
+        run: |
+          set -eu
+          pacman -Q ca-certificates ca-certificates-utils curl openssl || true
+          curl --version | sed -n '1,2p'
+          for b in g3b g3c g3b-aaa g3c-aaa; do
+            for a in dv ov ev; do
+              host="$a-$b-emudhra.we-have-a-problem.com"
+              if curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$host/" 2>/dev/null; then
+                printf 'raw_arch_curl host=%s result=accepted_tls\n' "$host"
+              else
+                code=$?; printf 'raw_arch_curl host=%s curl_exit=%s\n' "$host" "$code"
+              fi
+            done
+          done
+          for host in dv-g3b-noct-emudhra.we-have-a-problem.com dv-g3b-aaa-noct-emudhra.we-have-a-problem.com github.com; do
+            if curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$host/" 2>/dev/null; then
+              printf 'raw_arch_curl host=%s result=accepted_tls\n' "$host"
+            else
+              code=$?; printf 'raw_arch_curl host=%s curl_exit=%s\n' "$host" "$code"
+            fi
+          done
+      - name: Deny the two public roots before any Arch package download
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_ACTIONS:-}" = true
+          test "${RUNNER_ENVIRONMENT:-}" = github-hosted
+          test "$(id -u)" = 0
+          test -f /etc/arch-release
+          command -v update-ca-trust >/dev/null
+          # Offline, exact public-root deny in this disposable container, before pacman networking.
+          arcade_trust_tmp="$RUNNER_TEMP/arcade-arch-native-deny"
+          mkdir -p "$arcade_trust_tmp"
+          printf '%s' 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNUakNDQWRPZ0F3SUJBZ0lLUFBZSHFXaHdEdHFMaERBS0JnZ3Foa2pPUFFRREF6QnJNUXN3Q1FZRFZRUUcKRXdKSlRqRVRNQkVHQTFVRUN4TUtaVzFUYVdkdUlGQkxTVEVsTUNNR0ExVUVDaE1jWlUxMVpHaHlZU0JVWldObwpibTlzYjJkcFpYTWdUR2x0YVhSbFpERWdNQjRHQTFVRUF4TVhaVzFUYVdkdUlFVkRReUJTYjI5MElFTkJJQzBnClJ6TXdIaGNOTVRnd01qRTRNVGd6TURBd1doY05ORE13TWpFNE1UZ3pNREF3V2pCck1Rc3dDUVlEVlFRR0V3SkoKVGpFVE1CRUdBMVVFQ3hNS1pXMVRhV2R1SUZCTFNURWxNQ01HQTFVRUNoTWNaVTExWkdoeVlTQlVaV05vYm05cwpiMmRwWlhNZ1RHbHRhWFJsWkRFZ01CNEdBMVVFQXhNWFpXMVRhV2R1SUVWRFF5QlNiMjkwSUVOQklDMGdSek13CmRqQVFCZ2NxaGtqT1BRSUJCZ1VyZ1FRQUlnTmlBQVFqcFF5NExSTDFLUE94c3QzaUFoS0FuamxmU1UyZnlTVTAKV1hUc3V3WWM1OEJ5citpdUwrRkJWSWNVcUVxeTZIeUM1bHRxdGR5emRjNkxCdENHSTc5RzFZNFBQd1QwMXh5UwpmdmFsWThMMVg0NHVUNkVZR1FJck1ncUNaSDBXazlHalFqQkFNQjBHQTFVZERnUVdCQlI4WFFLRUU5VE1pcHVCCnpoY2NMaWtlbkVoalFqQU9CZ05WSFE4QkFmOEVCQU1DQVFZd0R3WURWUjBUQVFIL0JBVXdBd0VCL3pBS0JnZ3EKaGtqT1BRUURBd05wQURCbUFqRUF2dk5oendJUUhXU1ZCN2dZYm9pRkJTK0RDQmVReWgrS1RPZ05HM3F4cmRXQgpDVWZ2TzZ3SUJIeGNtYkh0UndmU0FqRUFuYnBWL0tsSzZPM3Q1bllCUW52SStHRFpqVkdMVlR2N2pIdnJaUW5ECitKYk5SNmlDOGhaVmR5UitFaENWQkN5agotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==' | base64 --decode > "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem"
+          arcade_der_sha=$(openssl x509 -in "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem" -outform DER | sha256sum)
+          test "${arcade_der_sha%% *}" = '86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b'
+          install -D -m 0644 "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem" '/etc/ca-certificates/trust-source/blocklist/cobas-86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem'
+          printf 'arch_native_deny public_root_sha256=%s\n' '86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b'
+          printf '%s' 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVNakNDQXhxZ0F3SUJBZ0lCQVRBTkJna3Foa2lHOXcwQkFRVUZBREI3TVFzd0NRWURWUVFHRXdKSFFqRWIKTUJrR0ExVUVDQXdTUjNKbFlYUmxjaUJOWVc1amFHVnpkR1Z5TVJBd0RnWURWUVFIREFkVFlXeG1iM0prTVJvdwpHQVlEVlFRS0RCRkRiMjF2Wkc4Z1EwRWdUR2x0YVhSbFpERWhNQjhHQTFVRUF3d1lRVUZCSUVObGNuUnBabWxqCllYUmxJRk5sY25acFkyVnpNQjRYRFRBME1ERXdNVEF3TURBd01Gb1hEVEk0TVRJek1USXpOVGsxT1Zvd2V6RUwKTUFrR0ExVUVCaE1DUjBJeEd6QVpCZ05WQkFnTUVrZHlaV0YwWlhJZ1RXRnVZMmhsYzNSbGNqRVFNQTRHQTFVRQpCd3dIVTJGc1ptOXlaREVhTUJnR0ExVUVDZ3dSUTI5dGIyUnZJRU5CSUV4cGJXbDBaV1F4SVRBZkJnTlZCQU1NCkdFRkJRU0JEWlhKMGFXWnBZMkYwWlNCVFpYSjJhV05sY3pDQ0FTSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnRVAKQURDQ0FRb0NnZ0VCQUw1QW5mUnU0ZXAyaHh4TlJVU092a2JJZ3dhZHdTcitHQitPNUFMNjg2dGRVSW9XTVF1YQpCdERGY0NMTlNTMVVZOHkyYm1oR0MxUHF5MHdrd0x4eVR1cnhGYTcwVkpvU0NzTjZzak5nNHRxSlZmTWlXUFBlCjNNL3ZnNGFpakpSUG4yanltSkJHaENmSGRyL2p6RFVzaTE0SFpHV0N3RWl3cUpINVlaOTJJRkNva2NkbXRldDQKWWdOVzhJb2FFK294b3g2Z21mMDQ5dlluTWxodkIvVnJ1UHNVSzYrM3FzeldZMTl6ak5vRm1hZzRxTXNYZURaUgpyT21lOUhnNmpjOFAyVUxpbUF5ckw1OE9BZDd2bjVsSjhTM2ZySFJORzVpMVI4WGxLZEg1a0JqSFlweStnOGNtCmV6NktKY2ZBM1ozbU5XZ1FJSjJQMk43U3c0U2NEVjdvTDhrQ0F3RUFBYU9Cd0RDQnZUQWRCZ05WSFE0RUZnUVUKb0JFS0l6Nlc4UWZzNHE4cDc0S2xmOUF3cExRd0RnWURWUjBQQVFIL0JBUURBZ0VHTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d2V3WURWUjBmQkhRd2NqQTRvRGFnTklZeWFIUjBjRG92TDJOeWJDNWpiMjF2Wkc5allTNWpiMjB2ClFVRkJRMlZ5ZEdsbWFXTmhkR1ZUWlhKMmFXTmxjeTVqY213d05xQTBvREtHTUdoMGRIQTZMeTlqY213dVkyOXQKYjJSdkxtNWxkQzlCUVVGRFpYSjBhV1pwWTJGMFpWTmxjblpwWTJWekxtTnliREFOQmdrcWhraUc5dzBCQVFVRgpBQU9DQVFFQUNGYjhBdkNiNlArayt0Wjd4a1NBemsvRXhmWUFXTXltdHJ3VVNXZ0VkdWptN2wzc0FnOWcxbzFRCkdFOG1UZ0hqNXJDbDdyKzhkRlJCdi8zOEVyakhUMXIwaVdBRmYyQzNCVXJ6OXZIQ3Y4UzVkSWEyTFgxcnpOTHoKUnQwdnh1QnF3OE0wQXl4OWx0MWF3ZzZuQ3BuQkJZdXJEQy96WERyUGJEZFZDWWZlVTBCc1dPLzh0cXRsYmdUMgpHOXc4NEZvVnhwN1o4VmxJTUNGbEEyenM2U0Z6N0pzRG9lQTNyYUFWR0kvNnVnTE9weXlwRUJNczFPVUlKcXNpCmwyRDRrRjUwMUtLYVU3M3lxV2pnb203QzEyeXhvdytldit0bzUxYnlydkxqS3pnNkNZRzFhNFhYdmkzdFB4cTMKc21QaTlXSXNndFJxQUVGUThUbURuNVhwTnBhWWJnPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=' | base64 --decode > "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem"
+          arcade_der_sha=$(openssl x509 -in "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem" -outform DER | sha256sum)
+          test "${arcade_der_sha%% *}" = 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'
+          install -D -m 0644 "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem" '/etc/ca-certificates/trust-source/blocklist/cobas-d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem'
+          printf 'arch_native_deny public_root_sha256=%s\n' 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'
+          update-ca-trust extract
+          # Native curl must now reject every fixture before package index/package downloads.
+          for arcade_chain in g3b g3c g3b-aaa g3c-aaa; do
+            for arcade_kind in dv ov ev; do
+              arcade_host="$arcade_kind-$arcade_chain-emudhra.we-have-a-problem.com"
+              if curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$arcade_host/" 2>/dev/null; then
+                printf 'arch_native_tls host=%s result=accepted_tls\n' "$arcade_host"; exit 1
+              else
+                arcade_curl_exit=$?; test "$arcade_curl_exit" -eq 60
+                printf 'arch_native_tls host=%s result=rejected_certificate\n' "$arcade_host"
+              fi
+            done
+          done
+          for arcade_host in dv-g3b-noct-emudhra.we-have-a-problem.com dv-g3b-aaa-noct-emudhra.we-have-a-problem.com; do
+            if curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$arcade_host/" 2>/dev/null; then
+              printf 'arch_native_tls host=%s result=accepted_tls\n' "$arcade_host"; exit 1
+            else
+              arcade_curl_exit=$?; test "$arcade_curl_exit" -eq 60
+              printf 'arch_native_tls host=%s result=rejected_certificate\n' "$arcade_host"
+            fi
+          done
+          for arcade_host in github.com geo.mirror.pkgbuild.com; do
+            curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$arcade_host/"
+            printf 'arch_native_tls host=%s result=accepted_tls\n' "$arcade_host"
+          done
+      - name: Install audit Python from signed Arch packages
+        run: pacman -Syu --noconfirm python ca-certificates ca-certificates-utils curl
+      - name: Prepare scoped CI certificate trust before actions
+        shell: bash
+        run: |
+          python3 - <<'CI_TRUST_PY'
+          import base64, concurrent.futures, hashlib, json, os, pathlib, socket, ssl, subprocess, sys
+          bad = {'86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b', 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'}
+          keys = ['SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO', 'PIP_CERT', 'NODE_OPTIONS', 'CURL_HOME', 'GIT_SSL_CAPATH', 'CARGO_HTTP_CAINFO']
+          raw_env = {k:v for k,v in os.environ.items() if k not in keys}
+          for k in keys:
+              os.environ.pop(k, None)
+          paths = ssl.get_default_verify_paths()
+          raw = ssl.create_default_context()
+          roots = {hashlib.sha256(c).hexdigest():c for c in raw.get_ca_certs(binary_form=True)}
+          assert len(roots) >= 80, 'Unexpectedly small runner CA store; refusing replacement'
+          probe = os.environ.get('CI_TRUST_PROBE') == '1'
+          hosts = [f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']] + ['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          controls = ['github.com','registry.npmjs.org','pypi.org','files.pythonhosted.org']
+          def tls(host, context):
+              try:
+                  with socket.create_connection((host,443), timeout=10) as s:
+                      with context.wrap_socket(s,server_hostname=host):
+                          return {'host':host,'result':'accepted_tls'}
+              except ssl.SSLCertVerificationError:
+                  return {'host':host,'result':'rejected_certificate'}
+              except Exception as e:
+                  return {'host':host,'result':'transport_error','error_type':type(e).__name__}
+          def python_probes(context):
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  return list(pool.map(lambda h:tls(h,context),hosts+controls))
+          node_code = r"""
+          const tls=require('node:tls');
+          const hosts=JSON.parse(process.argv[1]);
+          Promise.all(hosts.map(host=>new Promise(resolve=>{
+           let done=false; const end=result=>{if(!done){done=true;resolve({host,result});s.destroy();}};
+           const s=tls.connect({host,port:443,servername:host,rejectUnauthorized:true},()=>end('accepted_tls'));
+           s.setTimeout(10000,()=>end('transport_error'));
+           s.on('error',e=>end(/CERT|ISSUER|VERIFY|SELF_SIGNED/.test(e.code||'')?'rejected_certificate':'transport_error'));
+          }))).then(rows=>console.log(JSON.stringify({node:process.version,openssl:process.versions.openssl,executable:process.execPath,rows})));
+          """
+          # Find the actual JavaScript action runtime, rather than trusting the action.yml label.
+          node_paths = []
+          for root in ['/home/runner/runners','/Users/runner/runners']:
+              node_paths += sorted(pathlib.Path(root).glob('*/externals/node24/bin/node'))
+          node_paths += [pathlib.Path('/__e/node24/bin/node'),pathlib.Path('/home/runner/actions-runner/externals/node24/bin/node')]
+          worker_executables=[]
+          for proc in pathlib.Path('/proc').glob('[0-9]*'):
+              try:
+                  if (proc/'comm').read_text().strip() in ('Runner.Worker','Runner.Listener'):
+                      executable=(proc/'exe').resolve()
+                      worker_executables.append(str(executable))
+                      node_paths.insert(0,executable.parent.parent/'externals/node24/bin/node')
+              except (OSError,PermissionError):
+                  pass
+          try:
+              for line in subprocess.check_output(['ps','-axo','comm='], text=True).splitlines():
+                  p=pathlib.Path(line.strip())
+                  if p.name == 'Runner.Worker' and p.is_absolute():
+                      node_paths.insert(0,p.parent.parent/'externals/node24/bin/node')
+          except (OSError,subprocess.CalledProcessError):
+              pass
+          node = next((p for p in node_paths if p.is_file()),None)
+          def node_probes(env):
+              if node is None:
+                  print(json.dumps({'runner_worker_executables':worker_executables,'node_candidates':[str(p) for p in node_paths]},sort_keys=True),flush=True)
+              assert node is not None, 'Actual action node24 binary was not found' 
+              return json.loads(subprocess.check_output([str(node),'-e',node_code,json.dumps(hosts+controls)],env=env,text=True,timeout=35))
+          def curl_probes(env):
+              def one(h):
+                  r=subprocess.run(['curl','--noproxy','*','--silent','--show-error','--head','--output',os.devnull,'--connect-timeout','8','--max-time','12','https://'+h+'/'],env=env,capture_output=True,text=True,timeout=15)
+                  return {'host':h,'result':'accepted_tls' if r.returncode==0 else ('rejected_certificate' if r.returncode==60 else 'transport_error'),'exit':r.returncode}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  return list(pool.map(one,hosts+controls))
+          def gate(rows):
+              assert len(rows)==18
+              assert all(r['result']=='rejected_certificate' for r in rows if r['host'] in hosts), 'Affected chain accepted or network inconclusive'
+              assert all(r['result']=='accepted_tls' for r in rows if r['host'] in controls), 'Normal TLS control failed'
+          if probe:
+              print(json.dumps({'phase':'raw_runner_before_scoped_changes','python':sys.version.split()[0],'openssl':ssl.OPENSSL_VERSION,'ca_paths':list(paths),'python_tls':python_probes(raw),'action_node':node_probes(raw_env),'curl_tls':curl_probes(raw_env)},sort_keys=True),flush=True)
+          # Remove only the two public trust anchors covering the compromised emSign chains.
+          # Preserve every other anchor. An empty directory prevents OpenSSL capath fallback.
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'cobas-ci-trust'
+          out.mkdir(mode=0o755,parents=True,exist_ok=True)
+          os.chmod(out,0o755)
+          empty = out/'empty'; empty.mkdir(exist_ok=True); os.chmod(empty,0o755)
+          bundle = out/'roots.pem'
+          kept = {h:c for h,c in roots.items() if h not in bad}
+          bundle.write_text(''.join(ssl.DER_cert_to_PEM_cert(c) for c in kept.values()))
+          os.chmod(bundle,0o644)
+          assert set(roots)-set(kept) <= bad and not (set(kept)&bad)
+          settings = {k:str(bundle) for k in ['SSL_CERT_FILE','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT']}
+          settings['SSL_CERT_DIR']=str(empty)
+          settings['GIT_SSL_CAPATH']=str(empty)
+          settings['CARGO_HTTP_CAINFO']=str(bundle)
+          # libcurl's compiled default CApath can override SSL_CERT_DIR. A job-scoped
+          # curlrc closes that fallback for normal curl calls; --disable callers are separate.
+          (out/'.curlrc').write_text('cacert = '+json.dumps(str(bundle))+'\ncapath = '+json.dumps(str(empty))+'\n')
+          settings['CURL_HOME']=str(out)
+          settings['HOMEBREW_CURLRC']=str(out/'.curlrc')
+          protected_env={**raw_env,**settings,'NODE_OPTIONS':'--use-openssl-ca'}
+          protected=ssl.create_default_context(cafile=str(bundle),capath=str(empty))
+          # APT/GnuTLS does not inherit Node/curl trust settings. Configure its supported
+          # CAInfo explicitly before owned package bootstrap; preserve package signing keys.
+          apt_helper=pathlib.Path('/usr/lib/apt/apt-helper')
+          if os.environ.get('CI_TRUST_APT') == '1' and sys.platform.startswith('linux') and apt_helper.is_file():
+              assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
+              import re,tempfile
+              apt_dir=pathlib.Path('/etc/apt/cobas-ci')
+              subprocess.run(['sudo','-n','install','-d','-m','0755',str(apt_dir)],check=True,capture_output=True,text=True,timeout=15)
+              apt_bundle=apt_dir/'roots.pem'
+              subprocess.run(['sudo','-n','install','-m','0644',str(bundle),str(apt_bundle)],check=True,capture_output=True,text=True,timeout=15)
+              assert hashlib.sha256(apt_bundle.read_bytes()).digest()==hashlib.sha256(bundle.read_bytes()).digest()
+              apt_config='Acquire::https::CAInfo '+json.dumps(str(apt_bundle))+';\nAcquire::https::Verify-Peer "true";\nAcquire::https::Verify-Host "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n'
+              subprocess.run(['sudo','-n','tee','/etc/apt/apt.conf.d/99zz-cobas-ci-trust'],input=apt_config,check=True,capture_output=True,text=True,timeout=15)
+              changed=[]
+              sources=[pathlib.Path('/etc/apt/sources.list'),pathlib.Path('/etc/apt/apt-mirrors.txt')]+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.list'))+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.sources'))
+              for source in sources:
+                  if not source.is_file():continue
+                  before=source.read_text()
+                  after=re.sub(r'https?://azure\.archive\.ubuntu\.com/ubuntu','https://archive.ubuntu.com/ubuntu',before)
+                  after=re.sub(r'http://(archive|security)\.ubuntu\.com/ubuntu',r'https://\1.ubuntu.com/ubuntu',after)
+                  if after!=before:
+                      subprocess.run(['sudo','-n','tee',str(source)],input=after,check=True,capture_output=True,text=True,timeout=15)
+                      changed.append(str(source))
+              print(json.dumps({'component':'owned_apt_https_configuration','ca_sha256':hashlib.sha256(apt_bundle.read_bytes()).hexdigest(),'verify_peer':True,'verify_host':True,'official_ubuntu_mirror_files_repaired':changed,'package_signing_keys_suites_components':'unchanged','scope':'Only this disposable GitHub-hosted job'},sort_keys=True),flush=True)
+              if probe:
+                  def apt_one(host):
+                      # The real acquire backend is used without root, auth or request bodies.
+                      # Public responses are discarded immediately; only TLS metadata remains.
+                      with tempfile.TemporaryDirectory(prefix='apt-tls-',dir=out) as scratch:
+                          target=pathlib.Path(scratch)/'discard';empty_auth=pathlib.Path(scratch)/'empty-auth';empty_auth.mkdir()
+                          uri='https://'+host+('/ubuntu/dists/noble/InRelease' if host=='archive.ubuntu.com' else '/')
+                          args=[str(apt_helper),'-o','Acquire::Retries=0','-o','Acquire::https::Timeout=8','-o','Acquire::https::Proxy=DIRECT','-o','Dir::Etc::netrc=/dev/null','-o','Dir::Etc::netrcparts='+str(empty_auth),'download-file',uri,str(target)]
+                          try:
+                              r=subprocess.run(args,capture_output=True,text=True,timeout=15)
+                              certificate=bool(re.search(r'certificate verification failed|certificate is NOT trusted|certificate issuer is unknown|error in the certificate verification',r.stderr+r.stdout,re.I))
+                              result='accepted_tls' if r.returncode==0 else ('rejected_certificate' if certificate else 'transport_error')
+                              return {'host':host,'result':result,'exit':r.returncode,**({'error_excerpt':r.stderr[-350:]} if result=='transport_error' else {})}
+                          except subprocess.TimeoutExpired:return {'host':host,'result':'transport_error','error_type':'timeout'}
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:apt_rows=list(pool.map(apt_one,hosts+['archive.ubuntu.com']))
+                  print(json.dumps({'component':'actual_apt_acquire_https','rows':apt_rows,'credentials_sent':False,'request_body_sent':False,'response_body_retained':False},sort_keys=True),flush=True)
+                  assert len(apt_rows)==15
+                  assert all(r['result']=='rejected_certificate' for r in apt_rows[:14]), 'APT TLS fixture rejection incomplete'
+                  assert apt_rows[-1]['result']=='accepted_tls', 'APT normal Ubuntu control failed'
+          print(json.dumps({'phase':'scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'actual_action_node':str(node) if node else None,'provider_boundary':'Runner .NET action downloads and host container pulls happen outside this shell; this does not attest them.'},sort_keys=True),flush=True)
+          # Preserve curl verification even when an owned caller passes --disable/-q.
+          # Flags precede the caller's -- URL separator; no credentials are put in this wrapper.
+          import shutil,shlex
+          real_curl=shutil.which('curl');assert real_curl and pathlib.Path(real_curl).resolve().is_file()
+          bin_dir=out/'bin';bin_dir.mkdir(mode=0o755,exist_ok=True);os.chmod(bin_dir,0o755)
+          wrapper=bin_dir/'curl'
+          wrapper.write_text('#!/bin/sh\nexec '+shlex.quote(real_curl)+' --cacert '+shlex.quote(str(bundle))+' --capath '+shlex.quote(str(empty))+' "$@"\n')
+          os.chmod(wrapper,0o755)
+          with open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(bin_dir)+'\n')
+          protected_env['PATH']=str(bin_dir)+os.pathsep+protected_env['PATH']
+          # Arch makepkg uses an absolute /usr/bin/curl agent. Preserve its full configuration
+          # and agent flags while replacing only the curl executable in a per-job config.
+          makepkg=pathlib.Path('/etc/makepkg.conf')
+          if makepkg.is_file():
+              config=out/'makepkg.conf'
+              text=makepkg.read_text()
+              assert '/usr/bin/curl' in text, 'Unexpected makepkg agent configuration'
+              config.write_text(text.replace('/usr/bin/curl',str(wrapper)))
+              os.chmod(config,0o644)
+              settings['MAKEPKG_CONF']=str(config)
+          if probe:
+              py=python_probes(protected); nd=node_probes(protected_env); cu=curl_probes(protected_env)
+              print(json.dumps({'phase':'scoped_runtime_acceptance','python_tls':py,'action_node':nd,'curl_tls':cu},sort_keys=True),flush=True)
+              gate(py); gate(nd['rows']); gate(cu)
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              for k,v in settings.items():
+                  f.write(f'{k}={v}\n')
+          # NODE_OPTIONS must be set directly in workflow env; GitHub forbids setting it via GITHUB_ENV.
+          CI_TRUST_PY
+
+      - name: Qualify actual pip session without changing runner packages
+        shell: bash
+        run: |
+          python3 - <<'CI_PIP_PY'
+          import hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          assert sys.version_info >= (3,10), 'Pinned pip truststore qualification requires Python >= 3.10'
+          hosts = [f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']] + ['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          controls=['pypi.org','files.pythonhosted.org']
+          code=r"""
+          import concurrent.futures, hashlib, json, sys
+          try:
+           import pip
+           from pip._vendor import certifi
+           from pip._internal.commands import create_command
+          except ImportError:
+           print(json.dumps({'installed':False})); raise SystemExit(0)
+          hosts=json.loads(sys.argv[1])
+          def one(host):
+           cmd=create_command('index',isolated=True)
+           options,args=cmd.parse_args(['--no-cache-dir','--disable-pip-version-check','--no-input','--keyring-provider','disabled','--retries','0','--timeout','10','versions','cobas-trust-probe'])
+           session=cmd._build_session(options)
+           session.trust_env=False;session.auth=None;session.proxies={}
+           try:
+            with session.head('https://'+host+'/',allow_redirects=False,timeout=10,stream=True) as r:
+             return {'host':host,'result':'accepted_tls'}
+           except Exception as e:
+            return {'host':host,'result':'rejected_certificate' if any(marker in repr(e) for marker in ('CERTIFICATE_VERIFY_FAILED','SSLCertVerificationError','SSLVerificationError','certificate is blocked')) else 'transport_error','error_type':type(e).__name__,'error':str(e)[:300]}
+           finally:session.close()
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:rows=list(pool.map(one,hosts))
+          print(json.dumps({'installed':True,'pip':pip.__version__,'vendored_ca_sha256':hashlib.sha256(open(certifi.where(),'rb').read()).hexdigest(),'session':'pip default _build_session, truststore plus vendored certifi, no auth/proxy/cache/body','rows':rows},sort_keys=True))
+          """
+          raw_env={k:v for k,v in os.environ.items() if k not in ['SSL_CERT_FILE','SSL_CERT_DIR','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT','PYTHONPATH']}
+          r=subprocess.run([sys.executable,'-c',code,json.dumps(hosts+controls)],env=raw_env,capture_output=True,text=True,timeout=45)
+          assert r.returncode==0, 'Stock pip session could not be audited: '+r.stderr[-200:]
+          print(json.dumps({'phase':'raw_provider_pip_inventory','result':json.loads(r.stdout)},sort_keys=True),flush=True)
+          # Fetch with the already-qualified stdlib verifier, verify the exact official wheel, and
+          # import it from this job's temporary wheel. No system/runner pip installation is changed.
+          url='https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl'
+          expected='fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+          wheel=pathlib.Path(os.environ['RUNNER_TEMP'])/'pip-26.2.2-py3-none-any.whl'
+          with urllib.request.urlopen(url,timeout=30) as r:data=r.read(3000000)
+          assert hashlib.sha256(data).hexdigest()==expected, 'Official pip wheel checksum mismatch'
+          wheel.write_bytes(data)
+          env={**os.environ,'PYTHONPATH':str(wheel)}
+          r=subprocess.run([sys.executable,'-c',code,json.dumps(hosts+controls)],env=env,capture_output=True,text=True,timeout=45)
+          assert r.returncode==0, 'Fixed pip session audit failed: '+r.stderr[-200:]
+          result=json.loads(r.stdout)
+          print(json.dumps({'phase':'fixed_pip_default_session_acceptance','wheel_sha256':expected,'result':result},sort_keys=True),flush=True)
+          assert result['pip']=='26.2.2'
+          assert len(result['rows'])==16
+          assert all(x['result']=='rejected_certificate' for x in result['rows'] if x['host'] in hosts)
+          assert all(x['result']=='accepted_tls' for x in result['rows'] if x['host'] in controls)
+          CI_PIP_PY
+
+      - name: Install the actual Arch Rust download clients from signed packages
+        run: pacman -S --noconfirm --needed rust
+      - name: Qualify actual Arch Rust downloader clients without checkout credentials
+        shell: bash
+        run: |
+          python3 - <<'CI_ARCH_RUST_PY'
+          #!/usr/bin/env python3
+          """Finite, credential-free actual downloader checks; all state uses job scratch."""
+          import concurrent.futures,json,os,pathlib,re,shutil,subprocess,tempfile
+          hosts=[f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']]+['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          scratch=pathlib.Path(tempfile.mkdtemp(prefix='ci-bootstrap-clients-',dir=os.environ['RUNNER_TEMP']))
+          pattern=re.compile(r'CERTIFICATE_VERIFY_FAILED|SSL certificate problem|SSL certificate OpenSSL verify result|invalid peer certificate|certificate verify failed|certificate has been revoked|certificate is revoked|InvalidCertificate|UnknownIssuer|UntrustedRoot|certificate is blocked',re.I)
+          versions={};rows=[]
+          for tool in ['cargo','rustup','mise']:
+           binary=shutil.which(tool)
+           if not binary:continue
+           version=subprocess.run([binary,'--version'],capture_output=True,text=True,timeout=15)
+           versions[tool]={'path':binary,'version':version.stdout.splitlines()[0] if version.stdout else 'unknown'}
+           def one(host):
+            state=scratch/(tool+'-'+host);state.mkdir();(state/'config.toml').write_text('')
+            env=dict(os.environ)
+            if tool=='cargo':
+             env.update(CARGO_HOME=str(state),CARGO_NET_RETRY='0',CARGO_HTTP_TIMEOUT='10')
+             args=[binary,'search','serde','--registry','ci_probe','--limit','1','--config',f'registries.ci_probe.index="sparse+https://{host}/"']
+            elif tool=='rustup':
+             env.update(RUSTUP_DIST_SERVER='https://'+host)
+             args=[binary,'check','--no-self-update']
+            else:
+             env.update(MISE_NODE_MIRROR_URL='https://'+host,XDG_CACHE_HOME=str(state/'cache'),MISE_CACHE_DIR=str(state/'cache'),MISE_STATE_DIR=str(state/'state'),MISE_CONFIG_DIR=str(state/'config'),MISE_USE_VERSIONS_HOST='0',MISE_NO_SELF_UPDATE='1',MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE=str(state/'config.toml'),MISE_HTTP_TIMEOUT='10s',MISE_HTTP_RETRIES='0')
+             args=[binary,'ls-remote','--no-versions-host','node']
+            try:
+             r=subprocess.run(args,env=env,cwd=state,capture_output=True,text=True,timeout=25)
+             return {'tool':tool,'host':host,'result':'rejected_certificate' if pattern.search(r.stderr+r.stdout) else 'not_certificate_rejection','exit':r.returncode,**({'error_excerpt':r.stderr[-500:]} if host==hosts[0] else {})}
+            except subprocess.TimeoutExpired:return {'tool':tool,'host':host,'result':'transport_timeout'}
+           with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:group=list(pool.map(one,hosts))
+           rows.extend(group)
+           # Real provider path proves this caller can still fetch ordinary metadata.
+           state=scratch/(tool+'-positive');state.mkdir();(state/'config.toml').write_text('');env=dict(os.environ)
+           if tool=='cargo':
+            env.update(CARGO_HOME=str(state),CARGO_NET_RETRY='0',CARGO_HTTP_TIMEOUT='15');args=[binary,'search','serde','--limit','1'];provider='index.crates.io + crates.io API'
+           elif tool=='rustup':
+            args=[binary,'check','--no-self-update'];provider='static.rust-lang.org rustup release metadata'
+           else:
+            env.update(XDG_CACHE_HOME=str(state/'cache'),MISE_CACHE_DIR=str(state/'cache'),MISE_STATE_DIR=str(state/'state'),MISE_CONFIG_DIR=str(state/'config'),MISE_USE_VERSIONS_HOST='0',MISE_NO_SELF_UPDATE='1',MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE=str(state/'config.toml'),MISE_HTTP_TIMEOUT='15s',MISE_HTTP_RETRIES='0');args=[binary,'ls-remote','--no-versions-host','node'];provider='nodejs.org release metadata'
+           try:
+            r=subprocess.run(args,env=env,cwd=state,capture_output=True,text=True,timeout=30)
+            rows.append({'tool':tool,'positive_provider':provider,'result':'accepted_tls' if r.returncode in ([0,100] if tool=='rustup' else [0]) else 'provider_check_failed','exit':r.returncode,**({'error_excerpt':r.stderr[-500:]} if r.returncode not in [0,100] else {})})
+           except subprocess.TimeoutExpired:rows.append({'tool':tool,'positive_provider':provider,'result':'transport_timeout'})
+          print(json.dumps({'component':'actual_ci_bootstrap_clients','versions':versions,'rows':rows,'method':'Actual readonly registry/version/check commands with per-probe empty state; no package/toolchain install, auth, source data or response bodies retained.'},sort_keys=True))
+          assert versions, 'No actual bootstrap clients found'
+          assert all(r['result']==('accepted_tls' if 'positive_provider' in r else 'rejected_certificate') for r in rows), 'Bootstrap downloader TLS acceptance is incomplete'
+          CI_ARCH_RUST_PY

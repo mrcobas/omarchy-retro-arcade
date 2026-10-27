@@ -2,10 +2,96 @@ name: Arcade build and package
 on: [push, pull_request]
 permissions:
   contents: read
+# JavaScript actions use the filtered OpenSSL store prepared before checkout.
+env:
+  NODE_OPTIONS: --use-openssl-ca
+
 jobs:
   native:
     runs-on: ubuntu-latest
+    env:
+      CI_TRUST_APT: '1'
     steps:
+      - name: Prepare scoped CI certificate trust before actions
+        shell: bash
+        run: |
+          python3 - <<'CI_TRUST_PY'
+          import hashlib, json, os, pathlib, re, ssl, subprocess, sys
+          bad = {'86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b', 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'}
+          keys = ['SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO', 'PIP_CERT', 'NODE_OPTIONS', 'CURL_HOME', 'GIT_SSL_CAPATH', 'CARGO_HTTP_CAINFO']
+          for k in keys:
+              os.environ.pop(k, None)
+          roots = {hashlib.sha256(c).hexdigest():c for c in ssl.create_default_context().get_ca_certs(binary_form=True)}
+          assert len(roots) >= 80, 'Unexpectedly small runner CA store; refusing replacement'
+          # Remove only the two public trust anchors covering the compromised emSign chains.
+          # Preserve every other anchor. An empty directory prevents OpenSSL capath fallback.
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'cobas-ci-trust'
+          out.mkdir(mode=0o755,parents=True,exist_ok=True)
+          os.chmod(out,0o755)
+          empty = out/'empty'; empty.mkdir(exist_ok=True); os.chmod(empty,0o755)
+          bundle = out/'roots.pem'
+          kept = {h:c for h,c in roots.items() if h not in bad}
+          bundle.write_text(''.join(ssl.DER_cert_to_PEM_cert(c) for c in kept.values()))
+          os.chmod(bundle,0o644)
+          assert set(roots)-set(kept) <= bad and not (set(kept)&bad)
+          settings = {k:str(bundle) for k in ['SSL_CERT_FILE','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT']}
+          settings['SSL_CERT_DIR']=str(empty)
+          settings['GIT_SSL_CAPATH']=str(empty)
+          settings['CARGO_HTTP_CAINFO']=str(bundle)
+          # libcurl's compiled default CApath can override SSL_CERT_DIR. A job-scoped
+          # curlrc closes that fallback for normal curl calls; --disable callers are separate.
+          (out/'.curlrc').write_text('cacert = '+json.dumps(str(bundle))+'\ncapath = '+json.dumps(str(empty))+'\n')
+          settings['CURL_HOME']=str(out)
+          settings['HOMEBREW_CURLRC']=str(out/'.curlrc')
+          # APT/GnuTLS does not inherit Node/curl trust settings. Configure its supported
+          # CAInfo explicitly before owned package bootstrap; preserve package signing keys.
+          apt_helper=pathlib.Path('/usr/lib/apt/apt-helper')
+          if os.environ.get('CI_TRUST_APT') == '1' and sys.platform.startswith('linux') and apt_helper.is_file():
+              assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
+              import re,tempfile
+              apt_dir=pathlib.Path('/etc/apt/cobas-ci')
+              subprocess.run(['sudo','-n','install','-d','-m','0755',str(apt_dir)],check=True,capture_output=True,text=True,timeout=15)
+              apt_bundle=apt_dir/'roots.pem'
+              subprocess.run(['sudo','-n','install','-m','0644',str(bundle),str(apt_bundle)],check=True,capture_output=True,text=True,timeout=15)
+              assert hashlib.sha256(apt_bundle.read_bytes()).digest()==hashlib.sha256(bundle.read_bytes()).digest()
+              apt_config='Acquire::https::CAInfo '+json.dumps(str(apt_bundle))+';\nAcquire::https::Verify-Peer "true";\nAcquire::https::Verify-Host "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n'
+              subprocess.run(['sudo','-n','tee','/etc/apt/apt.conf.d/99zz-cobas-ci-trust'],input=apt_config,check=True,capture_output=True,text=True,timeout=15)
+              changed=[]
+              sources=[pathlib.Path('/etc/apt/sources.list'),pathlib.Path('/etc/apt/apt-mirrors.txt')]+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.list'))+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.sources'))
+              for source in sources:
+                  if not source.is_file():continue
+                  before=source.read_text()
+                  after=re.sub(r'https?://azure\.archive\.ubuntu\.com/ubuntu','https://archive.ubuntu.com/ubuntu',before)
+                  after=re.sub(r'http://(archive|security)\.ubuntu\.com/ubuntu',r'https://\1.ubuntu.com/ubuntu',after)
+                  if after!=before:
+                      subprocess.run(['sudo','-n','tee',str(source)],input=after,check=True,capture_output=True,text=True,timeout=15)
+                      changed.append(str(source))
+              print(json.dumps({'component':'owned_apt_https_configuration','ca_sha256':hashlib.sha256(apt_bundle.read_bytes()).hexdigest(),'verify_peer':True,'verify_host':True,'official_ubuntu_mirror_files_repaired':changed,'package_signing_keys_suites_components':'unchanged','scope':'Only this disposable GitHub-hosted job'},sort_keys=True),flush=True)
+          # Flags precede the caller's -- URL separator; no credentials are put in this wrapper.
+          import shutil,shlex
+          real_curl=shutil.which('curl');assert real_curl and pathlib.Path(real_curl).resolve().is_file()
+          bin_dir=out/'bin';bin_dir.mkdir(mode=0o755,exist_ok=True);os.chmod(bin_dir,0o755)
+          wrapper=bin_dir/'curl'
+          wrapper.write_text('#!/bin/sh\nexec '+shlex.quote(real_curl)+' --cacert '+shlex.quote(str(bundle))+' --capath '+shlex.quote(str(empty))+' "$@"\n')
+          os.chmod(wrapper,0o755)
+          with open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(bin_dir)+'\n')
+          # Arch makepkg uses an absolute /usr/bin/curl agent. Preserve its full configuration
+          # and agent flags while replacing only the curl executable in a per-job config.
+          makepkg=pathlib.Path('/etc/makepkg.conf')
+          if makepkg.is_file():
+              config=out/'makepkg.conf'
+              text=makepkg.read_text()
+              assert '/usr/bin/curl' in text, 'Unexpected makepkg agent configuration'
+              config.write_text(text.replace('/usr/bin/curl',str(wrapper)))
+              os.chmod(config,0o644)
+              settings['MAKEPKG_CONF']=str(config)
+          print(json.dumps({'phase':'offline_scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'network_requests':0},sort_keys=True),flush=True)
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              for k,v in settings.items():
+                  f.write(f'{k}={v}\n')
+          # NODE_OPTIONS is set directly in workflow env, never through GITHUB_ENV.
+          CI_TRUST_PY
+
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -53,7 +139,111 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
+      - name: Deny the two public roots before any Arch package download
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_ACTIONS:-}" = true
+          test "${RUNNER_ENVIRONMENT:-}" = github-hosted
+          test "$(id -u)" = 0
+          test -f /etc/arch-release
+          command -v update-ca-trust >/dev/null
+          # Offline, exact public-root deny in this disposable container, before pacman networking.
+          arcade_trust_tmp="$RUNNER_TEMP/arcade-arch-native-deny"
+          mkdir -p "$arcade_trust_tmp"
+          printf '%s' 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUNUakNDQWRPZ0F3SUJBZ0lLUFBZSHFXaHdEdHFMaERBS0JnZ3Foa2pPUFFRREF6QnJNUXN3Q1FZRFZRUUcKRXdKSlRqRVRNQkVHQTFVRUN4TUtaVzFUYVdkdUlGQkxTVEVsTUNNR0ExVUVDaE1jWlUxMVpHaHlZU0JVWldObwpibTlzYjJkcFpYTWdUR2x0YVhSbFpERWdNQjRHQTFVRUF4TVhaVzFUYVdkdUlFVkRReUJTYjI5MElFTkJJQzBnClJ6TXdIaGNOTVRnd01qRTRNVGd6TURBd1doY05ORE13TWpFNE1UZ3pNREF3V2pCck1Rc3dDUVlEVlFRR0V3SkoKVGpFVE1CRUdBMVVFQ3hNS1pXMVRhV2R1SUZCTFNURWxNQ01HQTFVRUNoTWNaVTExWkdoeVlTQlVaV05vYm05cwpiMmRwWlhNZ1RHbHRhWFJsWkRFZ01CNEdBMVVFQXhNWFpXMVRhV2R1SUVWRFF5QlNiMjkwSUVOQklDMGdSek13CmRqQVFCZ2NxaGtqT1BRSUJCZ1VyZ1FRQUlnTmlBQVFqcFF5NExSTDFLUE94c3QzaUFoS0FuamxmU1UyZnlTVTAKV1hUc3V3WWM1OEJ5citpdUwrRkJWSWNVcUVxeTZIeUM1bHRxdGR5emRjNkxCdENHSTc5RzFZNFBQd1QwMXh5UwpmdmFsWThMMVg0NHVUNkVZR1FJck1ncUNaSDBXazlHalFqQkFNQjBHQTFVZERnUVdCQlI4WFFLRUU5VE1pcHVCCnpoY2NMaWtlbkVoalFqQU9CZ05WSFE4QkFmOEVCQU1DQVFZd0R3WURWUjBUQVFIL0JBVXdBd0VCL3pBS0JnZ3EKaGtqT1BRUURBd05wQURCbUFqRUF2dk5oendJUUhXU1ZCN2dZYm9pRkJTK0RDQmVReWgrS1RPZ05HM3F4cmRXQgpDVWZ2TzZ3SUJIeGNtYkh0UndmU0FqRUFuYnBWL0tsSzZPM3Q1bllCUW52SStHRFpqVkdMVlR2N2pIdnJaUW5ECitKYk5SNmlDOGhaVmR5UitFaENWQkN5agotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0tCg==' | base64 --decode > "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem"
+          arcade_der_sha=$(openssl x509 -in "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem" -outform DER | sha256sum)
+          test "${arcade_der_sha%% *}" = '86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b'
+          install -D -m 0644 "$arcade_trust_tmp/86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem" '/etc/ca-certificates/trust-source/blocklist/cobas-86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b.pem'
+          printf 'arch_native_deny public_root_sha256=%s\n' '86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b'
+          printf '%s' 'LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVNakNDQXhxZ0F3SUJBZ0lCQVRBTkJna3Foa2lHOXcwQkFRVUZBREI3TVFzd0NRWURWUVFHRXdKSFFqRWIKTUJrR0ExVUVDQXdTUjNKbFlYUmxjaUJOWVc1amFHVnpkR1Z5TVJBd0RnWURWUVFIREFkVFlXeG1iM0prTVJvdwpHQVlEVlFRS0RCRkRiMjF2Wkc4Z1EwRWdUR2x0YVhSbFpERWhNQjhHQTFVRUF3d1lRVUZCSUVObGNuUnBabWxqCllYUmxJRk5sY25acFkyVnpNQjRYRFRBME1ERXdNVEF3TURBd01Gb1hEVEk0TVRJek1USXpOVGsxT1Zvd2V6RUwKTUFrR0ExVUVCaE1DUjBJeEd6QVpCZ05WQkFnTUVrZHlaV0YwWlhJZ1RXRnVZMmhsYzNSbGNqRVFNQTRHQTFVRQpCd3dIVTJGc1ptOXlaREVhTUJnR0ExVUVDZ3dSUTI5dGIyUnZJRU5CSUV4cGJXbDBaV1F4SVRBZkJnTlZCQU1NCkdFRkJRU0JEWlhKMGFXWnBZMkYwWlNCVFpYSjJhV05sY3pDQ0FTSXdEUVlKS29aSWh2Y05BUUVCQlFBRGdnRVAKQURDQ0FRb0NnZ0VCQUw1QW5mUnU0ZXAyaHh4TlJVU092a2JJZ3dhZHdTcitHQitPNUFMNjg2dGRVSW9XTVF1YQpCdERGY0NMTlNTMVVZOHkyYm1oR0MxUHF5MHdrd0x4eVR1cnhGYTcwVkpvU0NzTjZzak5nNHRxSlZmTWlXUFBlCjNNL3ZnNGFpakpSUG4yanltSkJHaENmSGRyL2p6RFVzaTE0SFpHV0N3RWl3cUpINVlaOTJJRkNva2NkbXRldDQKWWdOVzhJb2FFK294b3g2Z21mMDQ5dlluTWxodkIvVnJ1UHNVSzYrM3FzeldZMTl6ak5vRm1hZzRxTXNYZURaUgpyT21lOUhnNmpjOFAyVUxpbUF5ckw1OE9BZDd2bjVsSjhTM2ZySFJORzVpMVI4WGxLZEg1a0JqSFlweStnOGNtCmV6NktKY2ZBM1ozbU5XZ1FJSjJQMk43U3c0U2NEVjdvTDhrQ0F3RUFBYU9Cd0RDQnZUQWRCZ05WSFE0RUZnUVUKb0JFS0l6Nlc4UWZzNHE4cDc0S2xmOUF3cExRd0RnWURWUjBQQVFIL0JBUURBZ0VHTUE4R0ExVWRFd0VCL3dRRgpNQU1CQWY4d2V3WURWUjBmQkhRd2NqQTRvRGFnTklZeWFIUjBjRG92TDJOeWJDNWpiMjF2Wkc5allTNWpiMjB2ClFVRkJRMlZ5ZEdsbWFXTmhkR1ZUWlhKMmFXTmxjeTVqY213d05xQTBvREtHTUdoMGRIQTZMeTlqY213dVkyOXQKYjJSdkxtNWxkQzlCUVVGRFpYSjBhV1pwWTJGMFpWTmxjblpwWTJWekxtTnliREFOQmdrcWhraUc5dzBCQVFVRgpBQU9DQVFFQUNGYjhBdkNiNlArayt0Wjd4a1NBemsvRXhmWUFXTXltdHJ3VVNXZ0VkdWptN2wzc0FnOWcxbzFRCkdFOG1UZ0hqNXJDbDdyKzhkRlJCdi8zOEVyakhUMXIwaVdBRmYyQzNCVXJ6OXZIQ3Y4UzVkSWEyTFgxcnpOTHoKUnQwdnh1QnF3OE0wQXl4OWx0MWF3ZzZuQ3BuQkJZdXJEQy96WERyUGJEZFZDWWZlVTBCc1dPLzh0cXRsYmdUMgpHOXc4NEZvVnhwN1o4VmxJTUNGbEEyenM2U0Z6N0pzRG9lQTNyYUFWR0kvNnVnTE9weXlwRUJNczFPVUlKcXNpCmwyRDRrRjUwMUtLYVU3M3lxV2pnb203QzEyeXhvdytldit0bzUxYnlydkxqS3pnNkNZRzFhNFhYdmkzdFB4cTMKc21QaTlXSXNndFJxQUVGUThUbURuNVhwTnBhWWJnPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=' | base64 --decode > "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem"
+          arcade_der_sha=$(openssl x509 -in "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem" -outform DER | sha256sum)
+          test "${arcade_der_sha%% *}" = 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'
+          install -D -m 0644 "$arcade_trust_tmp/d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem" '/etc/ca-certificates/trust-source/blocklist/cobas-d7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4.pem'
+          printf 'arch_native_deny public_root_sha256=%s\n' 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'
+          update-ca-trust extract
+
       - run: pacman -Syu --noconfirm git rust cmake python sdl2 sdl2_image sdl2_mixer libglvnd libx11 libxcursor libxi libxrandr libxkbcommon libxkbcommon-x11 libxtst wayland dbus mesa python-pillow libpulse xdg-desktop-portal xorg-server-xvfb xorg-xauth
+      - name: Prepare scoped CI certificate trust before actions
+        shell: bash
+        run: |
+          python3 - <<'CI_TRUST_PY'
+          import hashlib, json, os, pathlib, re, ssl, subprocess, sys
+          bad = {'86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b', 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'}
+          keys = ['SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO', 'PIP_CERT', 'NODE_OPTIONS', 'CURL_HOME', 'GIT_SSL_CAPATH', 'CARGO_HTTP_CAINFO']
+          for k in keys:
+              os.environ.pop(k, None)
+          roots = {hashlib.sha256(c).hexdigest():c for c in ssl.create_default_context().get_ca_certs(binary_form=True)}
+          assert len(roots) >= 80, 'Unexpectedly small runner CA store; refusing replacement'
+          # Remove only the two public trust anchors covering the compromised emSign chains.
+          # Preserve every other anchor. An empty directory prevents OpenSSL capath fallback.
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'cobas-ci-trust'
+          out.mkdir(mode=0o755,parents=True,exist_ok=True)
+          os.chmod(out,0o755)
+          empty = out/'empty'; empty.mkdir(exist_ok=True); os.chmod(empty,0o755)
+          bundle = out/'roots.pem'
+          kept = {h:c for h,c in roots.items() if h not in bad}
+          bundle.write_text(''.join(ssl.DER_cert_to_PEM_cert(c) for c in kept.values()))
+          os.chmod(bundle,0o644)
+          assert set(roots)-set(kept) <= bad and not (set(kept)&bad)
+          settings = {k:str(bundle) for k in ['SSL_CERT_FILE','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT']}
+          settings['SSL_CERT_DIR']=str(empty)
+          settings['GIT_SSL_CAPATH']=str(empty)
+          settings['CARGO_HTTP_CAINFO']=str(bundle)
+          # libcurl's compiled default CApath can override SSL_CERT_DIR. A job-scoped
+          # curlrc closes that fallback for normal curl calls; --disable callers are separate.
+          (out/'.curlrc').write_text('cacert = '+json.dumps(str(bundle))+'\ncapath = '+json.dumps(str(empty))+'\n')
+          settings['CURL_HOME']=str(out)
+          settings['HOMEBREW_CURLRC']=str(out/'.curlrc')
+          # APT/GnuTLS does not inherit Node/curl trust settings. Configure its supported
+          # CAInfo explicitly before owned package bootstrap; preserve package signing keys.
+          apt_helper=pathlib.Path('/usr/lib/apt/apt-helper')
+          if os.environ.get('CI_TRUST_APT') == '1' and sys.platform.startswith('linux') and apt_helper.is_file():
+              assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
+              import re,tempfile
+              apt_dir=pathlib.Path('/etc/apt/cobas-ci')
+              subprocess.run(['sudo','-n','install','-d','-m','0755',str(apt_dir)],check=True,capture_output=True,text=True,timeout=15)
+              apt_bundle=apt_dir/'roots.pem'
+              subprocess.run(['sudo','-n','install','-m','0644',str(bundle),str(apt_bundle)],check=True,capture_output=True,text=True,timeout=15)
+              assert hashlib.sha256(apt_bundle.read_bytes()).digest()==hashlib.sha256(bundle.read_bytes()).digest()
+              apt_config='Acquire::https::CAInfo '+json.dumps(str(apt_bundle))+';\nAcquire::https::Verify-Peer "true";\nAcquire::https::Verify-Host "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n'
+              subprocess.run(['sudo','-n','tee','/etc/apt/apt.conf.d/99zz-cobas-ci-trust'],input=apt_config,check=True,capture_output=True,text=True,timeout=15)
+              changed=[]
+              sources=[pathlib.Path('/etc/apt/sources.list'),pathlib.Path('/etc/apt/apt-mirrors.txt')]+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.list'))+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.sources'))
+              for source in sources:
+                  if not source.is_file():continue
+                  before=source.read_text()
+                  after=re.sub(r'https?://azure\.archive\.ubuntu\.com/ubuntu','https://archive.ubuntu.com/ubuntu',before)
+                  after=re.sub(r'http://(archive|security)\.ubuntu\.com/ubuntu',r'https://\1.ubuntu.com/ubuntu',after)
+                  if after!=before:
+                      subprocess.run(['sudo','-n','tee',str(source)],input=after,check=True,capture_output=True,text=True,timeout=15)
+                      changed.append(str(source))
+              print(json.dumps({'component':'owned_apt_https_configuration','ca_sha256':hashlib.sha256(apt_bundle.read_bytes()).hexdigest(),'verify_peer':True,'verify_host':True,'official_ubuntu_mirror_files_repaired':changed,'package_signing_keys_suites_components':'unchanged','scope':'Only this disposable GitHub-hosted job'},sort_keys=True),flush=True)
+          # Flags precede the caller's -- URL separator; no credentials are put in this wrapper.
+          import shutil,shlex
+          real_curl=shutil.which('curl');assert real_curl and pathlib.Path(real_curl).resolve().is_file()
+          bin_dir=out/'bin';bin_dir.mkdir(mode=0o755,exist_ok=True);os.chmod(bin_dir,0o755)
+          wrapper=bin_dir/'curl'
+          wrapper.write_text('#!/bin/sh\nexec '+shlex.quote(real_curl)+' --cacert '+shlex.quote(str(bundle))+' --capath '+shlex.quote(str(empty))+' "$@"\n')
+          os.chmod(wrapper,0o755)
+          with open(os.environ['GITHUB_PATH'],'a') as f:f.write(str(bin_dir)+'\n')
+          # Arch makepkg uses an absolute /usr/bin/curl agent. Preserve its full configuration
+          # and agent flags while replacing only the curl executable in a per-job config.
+          makepkg=pathlib.Path('/etc/makepkg.conf')
+          if makepkg.is_file():
+              config=out/'makepkg.conf'
+              text=makepkg.read_text()
+              assert '/usr/bin/curl' in text, 'Unexpected makepkg agent configuration'
+              config.write_text(text.replace('/usr/bin/curl',str(wrapper)))
+              os.chmod(config,0o644)
+              settings['MAKEPKG_CONF']=str(config)
+          print(json.dumps({'phase':'offline_scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'network_requests':0},sort_keys=True),flush=True)
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              for k,v in settings.items():
+                  f.write(f'{k}={v}\n')
+          # NODE_OPTIONS is set directly in workflow env, never through GITHUB_ENV.
+          CI_TRUST_PY
+
       - uses: actions/checkout@v4
       - name: Build the complete package
         run: |
