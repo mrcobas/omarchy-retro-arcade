@@ -259,6 +259,9 @@ jobs:
       - name: Qualify runner CLR HTTP boundary without touching the runner
         run: python3 .github/scripts/runner-dotnet-probe.py
 
+      - name: Verify actual Git HTTPS trust without credentials
+        run: python3 .github/scripts/ci-git-trust.py
+
   arch-trust:
     name: Certificate trust (Arch container)
     runs-on: ubuntu-latest
