@@ -125,6 +125,49 @@ jobs:
           settings['HOMEBREW_CURLRC']=str(out/'.curlrc')
           protected_env={**raw_env,**settings,'NODE_OPTIONS':'--use-openssl-ca'}
           protected=ssl.create_default_context(cafile=str(bundle),capath=str(empty))
+          # APT/GnuTLS does not inherit Node/curl trust settings. Configure its supported
+          # CAInfo explicitly before owned package bootstrap; preserve package signing keys.
+          apt_helper=pathlib.Path('/usr/lib/apt/apt-helper')
+          if sys.platform.startswith('linux') and apt_helper.is_file():
+              assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
+              import re,tempfile
+              apt_dir=pathlib.Path('/etc/apt/cobas-ci')
+              subprocess.run(['sudo','-n','install','-d','-m','0755',str(apt_dir)],check=True,capture_output=True,text=True,timeout=15)
+              apt_bundle=apt_dir/'roots.pem'
+              subprocess.run(['sudo','-n','install','-m','0644',str(bundle),str(apt_bundle)],check=True,capture_output=True,text=True,timeout=15)
+              assert hashlib.sha256(apt_bundle.read_bytes()).digest()==hashlib.sha256(bundle.read_bytes()).digest()
+              apt_config='Acquire::https::CAInfo '+json.dumps(str(apt_bundle))+';\nAcquire::https::Verify-Peer "true";\nAcquire::https::Verify-Host "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n'
+              subprocess.run(['sudo','-n','tee','/etc/apt/apt.conf.d/99zz-cobas-ci-trust'],input=apt_config,check=True,capture_output=True,text=True,timeout=15)
+              changed=[]
+              sources=[pathlib.Path('/etc/apt/sources.list'),pathlib.Path('/etc/apt/apt-mirrors.txt')]+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.list'))+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.sources'))
+              for source in sources:
+                  if not source.is_file():continue
+                  before=source.read_text()
+                  after=re.sub(r'https?://azure\.archive\.ubuntu\.com/ubuntu','https://archive.ubuntu.com/ubuntu',before)
+                  after=re.sub(r'http://(archive|security)\.ubuntu\.com/ubuntu',r'https://\1.ubuntu.com/ubuntu',after)
+                  if after!=before:
+                      subprocess.run(['sudo','-n','tee',str(source)],input=after,check=True,capture_output=True,text=True,timeout=15)
+                      changed.append(str(source))
+              print(json.dumps({'component':'owned_apt_https_configuration','ca_sha256':hashlib.sha256(apt_bundle.read_bytes()).hexdigest(),'verify_peer':True,'verify_host':True,'official_ubuntu_mirror_files_repaired':changed,'package_signing_keys_suites_components':'unchanged','scope':'Only this disposable GitHub-hosted job'},sort_keys=True),flush=True)
+              if probe:
+                  def apt_one(host):
+                      # The real acquire backend is used without root, auth or request bodies.
+                      # Public responses are discarded immediately; only TLS metadata remains.
+                      with tempfile.TemporaryDirectory(prefix='apt-tls-',dir=out) as scratch:
+                          target=pathlib.Path(scratch)/'discard';empty_auth=pathlib.Path(scratch)/'empty-auth';empty_auth.mkdir()
+                          uri='https://'+host+('/ubuntu/README' if host=='archive.ubuntu.com' else '/')
+                          args=[str(apt_helper),'-o','Acquire::Retries=0','-o','Acquire::https::Timeout=8','-o','Acquire::https::Proxy=DIRECT','-o','Dir::Etc::netrc=/dev/null','-o','Dir::Etc::netrcparts='+str(empty_auth),'download-file',uri,str(target)]
+                          try:
+                              r=subprocess.run(args,capture_output=True,text=True,timeout=15)
+                              certificate=bool(re.search(r'certificate verification failed|certificate is NOT trusted|certificate issuer is unknown|error in the certificate verification',r.stderr+r.stdout,re.I))
+                              result='accepted_tls' if r.returncode==0 else ('rejected_certificate' if certificate else 'transport_error')
+                              return {'host':host,'result':result,'exit':r.returncode,**({'error_excerpt':r.stderr[-350:]} if result=='transport_error' else {})}
+                          except subprocess.TimeoutExpired:return {'host':host,'result':'transport_error','error_type':'timeout'}
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:apt_rows=list(pool.map(apt_one,hosts+['archive.ubuntu.com']))
+                  print(json.dumps({'component':'actual_apt_acquire_https','rows':apt_rows,'credentials_sent':False,'request_body_sent':False,'response_body_retained':False},sort_keys=True),flush=True)
+                  assert len(apt_rows)==15
+                  assert all(r['result']=='rejected_certificate' for r in apt_rows[:14]), 'APT TLS fixture rejection incomplete'
+                  assert apt_rows[-1]['result']=='accepted_tls', 'APT normal Ubuntu control failed'
           print(json.dumps({'phase':'scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'actual_action_node':str(node) if node else None,'provider_boundary':'Runner .NET action downloads and host container pulls happen outside this shell; this does not attest them.'},sort_keys=True),flush=True)
           # Preserve curl verification even when an owned caller passes --disable/-q.
           # Flags precede the caller's -- URL separator; no credentials are put in this wrapper.
@@ -396,6 +439,49 @@ jobs:
           settings['HOMEBREW_CURLRC']=str(out/'.curlrc')
           protected_env={**raw_env,**settings,'NODE_OPTIONS':'--use-openssl-ca'}
           protected=ssl.create_default_context(cafile=str(bundle),capath=str(empty))
+          # APT/GnuTLS does not inherit Node/curl trust settings. Configure its supported
+          # CAInfo explicitly before owned package bootstrap; preserve package signing keys.
+          apt_helper=pathlib.Path('/usr/lib/apt/apt-helper')
+          if sys.platform.startswith('linux') and apt_helper.is_file():
+              assert os.environ.get('GITHUB_ACTIONS')=='true' and os.environ.get('RUNNER_ENVIRONMENT')=='github-hosted'
+              import re,tempfile
+              apt_dir=pathlib.Path('/etc/apt/cobas-ci')
+              subprocess.run(['sudo','-n','install','-d','-m','0755',str(apt_dir)],check=True,capture_output=True,text=True,timeout=15)
+              apt_bundle=apt_dir/'roots.pem'
+              subprocess.run(['sudo','-n','install','-m','0644',str(bundle),str(apt_bundle)],check=True,capture_output=True,text=True,timeout=15)
+              assert hashlib.sha256(apt_bundle.read_bytes()).digest()==hashlib.sha256(bundle.read_bytes()).digest()
+              apt_config='Acquire::https::CAInfo '+json.dumps(str(apt_bundle))+';\nAcquire::https::Verify-Peer "true";\nAcquire::https::Verify-Host "true";\nAcquire::Retries "2";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n'
+              subprocess.run(['sudo','-n','tee','/etc/apt/apt.conf.d/99zz-cobas-ci-trust'],input=apt_config,check=True,capture_output=True,text=True,timeout=15)
+              changed=[]
+              sources=[pathlib.Path('/etc/apt/sources.list'),pathlib.Path('/etc/apt/apt-mirrors.txt')]+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.list'))+list(pathlib.Path('/etc/apt/sources.list.d').glob('*.sources'))
+              for source in sources:
+                  if not source.is_file():continue
+                  before=source.read_text()
+                  after=re.sub(r'https?://azure\.archive\.ubuntu\.com/ubuntu','https://archive.ubuntu.com/ubuntu',before)
+                  after=re.sub(r'http://(archive|security)\.ubuntu\.com/ubuntu',r'https://\1.ubuntu.com/ubuntu',after)
+                  if after!=before:
+                      subprocess.run(['sudo','-n','tee',str(source)],input=after,check=True,capture_output=True,text=True,timeout=15)
+                      changed.append(str(source))
+              print(json.dumps({'component':'owned_apt_https_configuration','ca_sha256':hashlib.sha256(apt_bundle.read_bytes()).hexdigest(),'verify_peer':True,'verify_host':True,'official_ubuntu_mirror_files_repaired':changed,'package_signing_keys_suites_components':'unchanged','scope':'Only this disposable GitHub-hosted job'},sort_keys=True),flush=True)
+              if probe:
+                  def apt_one(host):
+                      # The real acquire backend is used without root, auth or request bodies.
+                      # Public responses are discarded immediately; only TLS metadata remains.
+                      with tempfile.TemporaryDirectory(prefix='apt-tls-',dir=out) as scratch:
+                          target=pathlib.Path(scratch)/'discard';empty_auth=pathlib.Path(scratch)/'empty-auth';empty_auth.mkdir()
+                          uri='https://'+host+('/ubuntu/README' if host=='archive.ubuntu.com' else '/')
+                          args=[str(apt_helper),'-o','Acquire::Retries=0','-o','Acquire::https::Timeout=8','-o','Acquire::https::Proxy=DIRECT','-o','Dir::Etc::netrc=/dev/null','-o','Dir::Etc::netrcparts='+str(empty_auth),'download-file',uri,str(target)]
+                          try:
+                              r=subprocess.run(args,capture_output=True,text=True,timeout=15)
+                              certificate=bool(re.search(r'certificate verification failed|certificate is NOT trusted|certificate issuer is unknown|error in the certificate verification',r.stderr+r.stdout,re.I))
+                              result='accepted_tls' if r.returncode==0 else ('rejected_certificate' if certificate else 'transport_error')
+                              return {'host':host,'result':result,'exit':r.returncode,**({'error_excerpt':r.stderr[-350:]} if result=='transport_error' else {})}
+                          except subprocess.TimeoutExpired:return {'host':host,'result':'transport_error','error_type':'timeout'}
+                  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:apt_rows=list(pool.map(apt_one,hosts+['archive.ubuntu.com']))
+                  print(json.dumps({'component':'actual_apt_acquire_https','rows':apt_rows,'credentials_sent':False,'request_body_sent':False,'response_body_retained':False},sort_keys=True),flush=True)
+                  assert len(apt_rows)==15
+                  assert all(r['result']=='rejected_certificate' for r in apt_rows[:14]), 'APT TLS fixture rejection incomplete'
+                  assert apt_rows[-1]['result']=='accepted_tls', 'APT normal Ubuntu control failed'
           print(json.dumps({'phase':'scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'actual_action_node':str(node) if node else None,'provider_boundary':'Runner .NET action downloads and host container pulls happen outside this shell; this does not attest them.'},sort_keys=True),flush=True)
           # Preserve curl verification even when an owned caller passes --disable/-q.
           # Flags precede the caller's -- URL separator; no credentials are put in this wrapper.
