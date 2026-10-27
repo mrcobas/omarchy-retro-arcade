@@ -3,7 +3,7 @@
 import concurrent.futures,json,os,pathlib,re,shutil,subprocess,tempfile
 hosts=[f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']]+['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
 scratch=pathlib.Path(tempfile.mkdtemp(prefix='ci-bootstrap-clients-',dir=os.environ['RUNNER_TEMP']))
-pattern=re.compile(r'CERTIFICATE_VERIFY_FAILED|SSL certificate problem|invalid peer certificate|certificate verify failed|certificate has been revoked|certificate is revoked|InvalidCertificate|UnknownIssuer|UntrustedRoot|certificate is blocked',re.I)
+pattern=re.compile(r'CERTIFICATE_VERIFY_FAILED|SSL certificate problem|SSL certificate OpenSSL verify result|invalid peer certificate|certificate verify failed|certificate has been revoked|certificate is revoked|InvalidCertificate|UnknownIssuer|UntrustedRoot|certificate is blocked',re.I)
 versions={};rows=[]
 for tool in ['cargo','rustup','mise']:
  binary=shutil.which(tool)
@@ -11,7 +11,7 @@ for tool in ['cargo','rustup','mise']:
  version=subprocess.run([binary,'--version'],capture_output=True,text=True,timeout=15)
  versions[tool]={'path':binary,'version':version.stdout.splitlines()[0] if version.stdout else 'unknown'}
  def one(host):
-  state=scratch/(tool+'-'+host);state.mkdir()
+  state=scratch/(tool+'-'+host);state.mkdir();(state/'config.toml').write_text('')
   env=dict(os.environ)
   if tool=='cargo':
    env.update(CARGO_HOME=str(state),CARGO_NET_RETRY='0',CARGO_HTTP_TIMEOUT='10')
@@ -20,7 +20,7 @@ for tool in ['cargo','rustup','mise']:
    env.update(RUSTUP_DIST_SERVER='https://'+host)
    args=[binary,'check','--no-self-update']
   else:
-   env.update(MISE_NODE_MIRROR_URL='https://'+host,XDG_CACHE_HOME=str(state/'cache'),MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE='/dev/null',MISE_HTTP_TIMEOUT='10',MISE_HTTP_RETRIES='0')
+   env.update(MISE_NODE_MIRROR_URL='https://'+host,XDG_CACHE_HOME=str(state/'cache'),MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE=str(state/'config.toml'),MISE_HTTP_TIMEOUT='10',MISE_HTTP_RETRIES='0')
    args=[binary,'ls-remote','node']
   try:
    r=subprocess.run(args,env=env,cwd=state,capture_output=True,text=True,timeout=25)
@@ -29,13 +29,13 @@ for tool in ['cargo','rustup','mise']:
  with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:group=list(pool.map(one,hosts))
  rows.extend(group)
  # Real provider path proves this caller can still fetch ordinary metadata.
- state=scratch/(tool+'-positive');state.mkdir();env=dict(os.environ)
+ state=scratch/(tool+'-positive');state.mkdir();(state/'config.toml').write_text('');env=dict(os.environ)
  if tool=='cargo':
   env.update(CARGO_HOME=str(state),CARGO_NET_RETRY='0',CARGO_HTTP_TIMEOUT='15');args=[binary,'search','serde','--limit','1'];provider='index.crates.io + crates.io API'
  elif tool=='rustup':
   args=[binary,'check','--no-self-update'];provider='static.rust-lang.org rustup release metadata'
  else:
-  env.update(XDG_CACHE_HOME=str(state/'cache'),MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE='/dev/null',MISE_HTTP_TIMEOUT='15',MISE_HTTP_RETRIES='0');args=[binary,'ls-remote','node'];provider='nodejs.org release metadata'
+  env.update(XDG_CACHE_HOME=str(state/'cache'),MISE_DATA_DIR=str(state/'data'),MISE_GLOBAL_CONFIG_FILE=str(state/'config.toml'),MISE_HTTP_TIMEOUT='15',MISE_HTTP_RETRIES='0');args=[binary,'ls-remote','node'];provider='nodejs.org release metadata'
  try:
   r=subprocess.run(args,env=env,cwd=state,capture_output=True,text=True,timeout=30)
   rows.append({'tool':tool,'positive_provider':provider,'result':'accepted_tls' if r.returncode in ([0,100] if tool=='rustup' else [0]) else 'provider_check_failed','exit':r.returncode,**({'error_excerpt':r.stderr[-500:]} if r.returncode not in [0,100] else {})})
