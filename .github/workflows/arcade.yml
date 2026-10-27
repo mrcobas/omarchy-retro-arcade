@@ -140,7 +140,7 @@ jobs:
                       # Public responses are discarded immediately; only TLS metadata remains.
                       with tempfile.TemporaryDirectory(prefix='apt-tls-',dir=out) as scratch:
                           target=pathlib.Path(scratch)/'discard';empty_auth=pathlib.Path(scratch)/'empty-auth';empty_auth.mkdir()
-                          uri='https://'+host+('/ubuntu/README' if host=='archive.ubuntu.com' else '/')
+                          uri='https://'+host+('/ubuntu/dists/noble/InRelease' if host=='archive.ubuntu.com' else '/')
                           args=[str(apt_helper),'-o','Acquire::Retries=0','-o','Acquire::https::Timeout=8','-o','Acquire::https::Proxy=DIRECT','-o','Dir::Etc::netrc=/dev/null','-o','Dir::Etc::netrcparts='+str(empty_auth),'download-file',uri,str(target)]
                           try:
                               r=subprocess.run(args,capture_output=True,text=True,timeout=15)
@@ -414,7 +414,7 @@ jobs:
                       # Public responses are discarded immediately; only TLS metadata remains.
                       with tempfile.TemporaryDirectory(prefix='apt-tls-',dir=out) as scratch:
                           target=pathlib.Path(scratch)/'discard';empty_auth=pathlib.Path(scratch)/'empty-auth';empty_auth.mkdir()
-                          uri='https://'+host+('/ubuntu/README' if host=='archive.ubuntu.com' else '/')
+                          uri='https://'+host+('/ubuntu/dists/noble/InRelease' if host=='archive.ubuntu.com' else '/')
                           args=[str(apt_helper),'-o','Acquire::Retries=0','-o','Acquire::https::Timeout=8','-o','Acquire::https::Proxy=DIRECT','-o','Dir::Etc::netrc=/dev/null','-o','Dir::Etc::netrcparts='+str(empty_auth),'download-file',uri,str(target)]
                           try:
                               r=subprocess.run(args,capture_output=True,text=True,timeout=15)
