@@ -1,0 +1,392 @@
+name: Qualify CI certificate trust
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+
+permissions:
+  contents: read
+
+env:
+  NODE_OPTIONS: --use-openssl-ca
+
+jobs:
+  trust:
+    name: Certificate trust (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ["ubuntu-latest"]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 8
+    env:
+      CI_TRUST_PROBE: '1'
+    steps:
+      - name: Prepare scoped CI certificate trust before actions
+        shell: bash
+        run: |
+          python3 - <<'CI_TRUST_PY'
+          import base64, concurrent.futures, hashlib, json, os, pathlib, socket, ssl, subprocess, sys
+          bad = {'86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b', 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'}
+          keys = ['SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO', 'PIP_CERT', 'NODE_OPTIONS', 'CURL_HOME', 'GIT_SSL_CAPATH', 'CARGO_HTTP_CAINFO']
+          raw_env = {k:v for k,v in os.environ.items() if k not in keys}
+          for k in keys:
+              os.environ.pop(k, None)
+          paths = ssl.get_default_verify_paths()
+          raw = ssl.create_default_context()
+          roots = {hashlib.sha256(c).hexdigest():c for c in raw.get_ca_certs(binary_form=True)}
+          assert len(roots) >= 80, 'Unexpectedly small runner CA store; refusing replacement'
+          probe = os.environ.get('CI_TRUST_PROBE') == '1'
+          hosts = [f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']] + ['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          controls = ['github.com','registry.npmjs.org','pypi.org','files.pythonhosted.org']
+          def tls(host, context):
+              try:
+                  with socket.create_connection((host,443), timeout=10) as s:
+                      with context.wrap_socket(s,server_hostname=host):
+                          return {'host':host,'result':'accepted_tls'}
+              except ssl.SSLCertVerificationError:
+                  return {'host':host,'result':'rejected_certificate'}
+              except Exception as e:
+                  return {'host':host,'result':'transport_error','error_type':type(e).__name__}
+          def python_probes(context):
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  return list(pool.map(lambda h:tls(h,context),hosts+controls))
+          node_code = r"""
+          const tls=require('node:tls');
+          const hosts=JSON.parse(process.argv[1]);
+          Promise.all(hosts.map(host=>new Promise(resolve=>{
+           let done=false; const end=result=>{if(!done){done=true;resolve({host,result});s.destroy();}};
+           const s=tls.connect({host,port:443,servername:host,rejectUnauthorized:true},()=>end('accepted_tls'));
+           s.setTimeout(10000,()=>end('transport_error'));
+           s.on('error',e=>end(/CERT|ISSUER|VERIFY|SELF_SIGNED/.test(e.code||'')?'rejected_certificate':'transport_error'));
+          }))).then(rows=>console.log(JSON.stringify({node:process.version,openssl:process.versions.openssl,executable:process.execPath,rows})));
+          """
+          # Find the actual JavaScript action runtime, rather than trusting the action.yml label.
+          node_paths = []
+          for root in ['/home/runner/runners','/Users/runner/runners']:
+              node_paths += sorted(pathlib.Path(root).glob('*/externals/node24/bin/node'))
+          node_paths += [pathlib.Path('/__e/node24/bin/node'),pathlib.Path('/home/runner/actions-runner/externals/node24/bin/node')]
+          worker_executables=[]
+          for proc in pathlib.Path('/proc').glob('[0-9]*'):
+              try:
+                  if (proc/'comm').read_text().strip() in ('Runner.Worker','Runner.Listener'):
+                      executable=(proc/'exe').resolve()
+                      worker_executables.append(str(executable))
+                      node_paths.insert(0,executable.parent.parent/'externals/node24/bin/node')
+              except (OSError,PermissionError):
+                  pass
+          try:
+              for line in subprocess.check_output(['ps','-axo','comm='], text=True).splitlines():
+                  p=pathlib.Path(line.strip())
+                  if p.name == 'Runner.Worker' and p.is_absolute():
+                      node_paths.insert(0,p.parent.parent/'externals/node24/bin/node')
+          except (OSError,subprocess.CalledProcessError):
+              pass
+          node = next((p for p in node_paths if p.is_file()),None)
+          def node_probes(env):
+              if node is None:
+                  print(json.dumps({'runner_worker_executables':worker_executables,'node_candidates':[str(p) for p in node_paths]},sort_keys=True),flush=True)
+              assert node is not None, 'Actual action node24 binary was not found' 
+              return json.loads(subprocess.check_output([str(node),'-e',node_code,json.dumps(hosts+controls)],env=env,text=True,timeout=35))
+          def curl_probes(env):
+              def one(h):
+                  r=subprocess.run(['curl','--noproxy','*','--silent','--show-error','--head','--output',os.devnull,'--connect-timeout','8','--max-time','12','https://'+h+'/'],env=env,capture_output=True,text=True,timeout=15)
+                  return {'host':h,'result':'accepted_tls' if r.returncode==0 else ('rejected_certificate' if r.returncode==60 else 'transport_error'),'exit':r.returncode}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  return list(pool.map(one,hosts+controls))
+          def gate(rows):
+              assert len(rows)==18
+              assert all(r['result']=='rejected_certificate' for r in rows if r['host'] in hosts), 'Affected chain accepted or network inconclusive'
+              assert all(r['result']=='accepted_tls' for r in rows if r['host'] in controls), 'Normal TLS control failed'
+          if probe:
+              print(json.dumps({'phase':'raw_runner_before_scoped_changes','python':sys.version.split()[0],'openssl':ssl.OPENSSL_VERSION,'ca_paths':list(paths),'python_tls':python_probes(raw),'action_node':node_probes(raw_env),'curl_tls':curl_probes(raw_env)},sort_keys=True),flush=True)
+          # Remove only the two public trust anchors covering the compromised emSign chains.
+          # Preserve every other anchor. An empty directory prevents OpenSSL capath fallback.
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'cobas-ci-trust'
+          out.mkdir(mode=0o700,parents=True,exist_ok=True)
+          empty = out/'empty'; empty.mkdir(exist_ok=True)
+          bundle = out/'roots.pem'
+          kept = {h:c for h,c in roots.items() if h not in bad}
+          bundle.write_text(''.join(ssl.DER_cert_to_PEM_cert(c) for c in kept.values()))
+          assert set(roots)-set(kept) <= bad and not (set(kept)&bad)
+          settings = {k:str(bundle) for k in ['SSL_CERT_FILE','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT']}
+          settings['SSL_CERT_DIR']=str(empty)
+          settings['GIT_SSL_CAPATH']=str(empty)
+          settings['CARGO_HTTP_CAINFO']=str(bundle)
+          # libcurl's compiled default CApath can override SSL_CERT_DIR. A job-scoped
+          # curlrc closes that fallback for normal curl calls; --disable callers are separate.
+          (out/'.curlrc').write_text('cacert = '+json.dumps(str(bundle))+'\ncapath = '+json.dumps(str(empty))+'\n')
+          settings['CURL_HOME']=str(out)
+          settings['HOMEBREW_CURLRC']=str(out/'.curlrc')
+          protected_env={**raw_env,**settings,'NODE_OPTIONS':'--use-openssl-ca'}
+          protected=ssl.create_default_context(cafile=str(bundle),capath=str(empty))
+          print(json.dumps({'phase':'scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'actual_action_node':str(node) if node else None,'provider_boundary':'Runner .NET action downloads and host container pulls happen outside this shell; this does not attest them.'},sort_keys=True),flush=True)
+          if probe:
+              py=python_probes(protected); nd=node_probes(protected_env); cu=curl_probes(protected_env)
+              print(json.dumps({'phase':'scoped_runtime_acceptance','python_tls':py,'action_node':nd,'curl_tls':cu},sort_keys=True),flush=True)
+              gate(py); gate(nd['rows']); gate(cu)
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              for k,v in settings.items():
+                  f.write(f'{k}={v}\n')
+          # NODE_OPTIONS must be set directly in workflow env; GitHub forbids setting it via GITHUB_ENV.
+          CI_TRUST_PY
+
+      - name: Qualify actual pip session without changing runner packages
+        shell: bash
+        run: |
+          python3 - <<'CI_PIP_PY'
+          import hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          assert sys.version_info >= (3,10), 'Pinned pip truststore qualification requires Python >= 3.10'
+          hosts = [f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']] + ['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          controls=['pypi.org','files.pythonhosted.org']
+          code=r"""
+          import concurrent.futures, hashlib, json, sys
+          try:
+           import pip
+           from pip._vendor import certifi
+           from pip._internal.commands import create_command
+          except ImportError:
+           print(json.dumps({'installed':False})); raise SystemExit(0)
+          hosts=json.loads(sys.argv[1])
+          def one(host):
+           cmd=create_command('index',isolated=True)
+           options,args=cmd.parse_args(['--no-cache-dir','--disable-pip-version-check','--no-input','--keyring-provider','disabled','--retries','0','--timeout','10','versions','cobas-trust-probe'])
+           session=cmd._build_session(options)
+           session.trust_env=False;session.auth=None;session.proxies={}
+           try:
+            with session.head('https://'+host+'/',allow_redirects=False,timeout=10,stream=True) as r:
+             return {'host':host,'result':'accepted_tls'}
+           except Exception as e:
+            return {'host':host,'result':'rejected_certificate' if any(marker in repr(e) for marker in ('CERTIFICATE_VERIFY_FAILED','SSLCertVerificationError','SSLVerificationError','certificate is blocked')) else 'transport_error','error_type':type(e).__name__,'error':str(e)[:300]}
+           finally:session.close()
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:rows=list(pool.map(one,hosts))
+          print(json.dumps({'installed':True,'pip':pip.__version__,'vendored_ca_sha256':hashlib.sha256(open(certifi.where(),'rb').read()).hexdigest(),'session':'pip default _build_session, truststore plus vendored certifi, no auth/proxy/cache/body','rows':rows},sort_keys=True))
+          """
+          raw_env={k:v for k,v in os.environ.items() if k not in ['SSL_CERT_FILE','SSL_CERT_DIR','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT','PYTHONPATH']}
+          r=subprocess.run([sys.executable,'-c',code,json.dumps(hosts+controls)],env=raw_env,capture_output=True,text=True,timeout=45)
+          assert r.returncode==0, 'Stock pip session could not be audited: '+r.stderr[-200:]
+          print(json.dumps({'phase':'raw_provider_pip_inventory','result':json.loads(r.stdout)},sort_keys=True),flush=True)
+          # Fetch with the already-qualified stdlib verifier, verify the exact official wheel, and
+          # import it from this job's temporary wheel. No system/runner pip installation is changed.
+          url='https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl'
+          expected='fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+          wheel=pathlib.Path(os.environ['RUNNER_TEMP'])/'pip-26.2.2-py3-none-any.whl'
+          with urllib.request.urlopen(url,timeout=30) as r:data=r.read(3000000)
+          assert hashlib.sha256(data).hexdigest()==expected, 'Official pip wheel checksum mismatch'
+          wheel.write_bytes(data)
+          env={**os.environ,'PYTHONPATH':str(wheel)}
+          r=subprocess.run([sys.executable,'-c',code,json.dumps(hosts+controls)],env=env,capture_output=True,text=True,timeout=45)
+          assert r.returncode==0, 'Fixed pip session audit failed: '+r.stderr[-200:]
+          result=json.loads(r.stdout)
+          print(json.dumps({'phase':'fixed_pip_default_session_acceptance','wheel_sha256':expected,'result':result},sort_keys=True),flush=True)
+          assert result['pip']=='26.2.2'
+          assert len(result['rows'])==16
+          assert all(x['result']=='rejected_certificate' for x in result['rows'] if x['host'] in hosts)
+          assert all(x['result']=='accepted_tls' for x in result['rows'] if x['host'] in controls)
+          CI_PIP_PY
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Qualify runner CLR HTTP boundary without touching the runner
+        run: python3 .github/scripts/runner-dotnet-probe.py
+
+  arch-trust:
+    name: Certificate trust (Arch container)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    timeout-minutes: 10
+    env:
+      CI_TRUST_PROBE: '1'
+    steps:
+      - name: Record raw container TLS before signed package bootstrap
+        shell: bash
+        run: |
+          set -eu
+          pacman -Q ca-certificates ca-certificates-utils curl openssl || true
+          curl --version | sed -n '1,2p'
+          for b in g3b g3c g3b-aaa g3c-aaa; do
+            for a in dv ov ev; do
+              host="$a-$b-emudhra.we-have-a-problem.com"
+              if curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$host/" 2>/dev/null; then
+                printf 'raw_arch_curl host=%s result=accepted_tls\n' "$host"
+              else
+                code=$?; printf 'raw_arch_curl host=%s curl_exit=%s\n' "$host" "$code"
+              fi
+            done
+          done
+          for host in dv-g3b-noct-emudhra.we-have-a-problem.com dv-g3b-aaa-noct-emudhra.we-have-a-problem.com github.com; do
+            if curl --disable --noproxy '*' --silent --show-error --head --output /dev/null --connect-timeout 8 --max-time 12 "https://$host/" 2>/dev/null; then
+              printf 'raw_arch_curl host=%s result=accepted_tls\n' "$host"
+            else
+              code=$?; printf 'raw_arch_curl host=%s curl_exit=%s\n' "$host" "$code"
+            fi
+          done
+      - name: Install audit Python from signed Arch packages
+        run: pacman -Syu --noconfirm python ca-certificates ca-certificates-utils curl
+      - name: Prepare scoped CI certificate trust before actions
+        shell: bash
+        run: |
+          python3 - <<'CI_TRUST_PY'
+          import base64, concurrent.futures, hashlib, json, os, pathlib, socket, ssl, subprocess, sys
+          bad = {'86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b', 'd7a7a0fb5d7e2731d771e9484ebcdef71d5f0c3e0a2948782bc83ee0ea699ef4'}
+          keys = ['SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'GIT_SSL_CAINFO', 'PIP_CERT', 'NODE_OPTIONS', 'CURL_HOME', 'GIT_SSL_CAPATH', 'CARGO_HTTP_CAINFO']
+          raw_env = {k:v for k,v in os.environ.items() if k not in keys}
+          for k in keys:
+              os.environ.pop(k, None)
+          paths = ssl.get_default_verify_paths()
+          raw = ssl.create_default_context()
+          roots = {hashlib.sha256(c).hexdigest():c for c in raw.get_ca_certs(binary_form=True)}
+          assert len(roots) >= 80, 'Unexpectedly small runner CA store; refusing replacement'
+          probe = os.environ.get('CI_TRUST_PROBE') == '1'
+          hosts = [f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']] + ['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          controls = ['github.com','registry.npmjs.org','pypi.org','files.pythonhosted.org']
+          def tls(host, context):
+              try:
+                  with socket.create_connection((host,443), timeout=10) as s:
+                      with context.wrap_socket(s,server_hostname=host):
+                          return {'host':host,'result':'accepted_tls'}
+              except ssl.SSLCertVerificationError:
+                  return {'host':host,'result':'rejected_certificate'}
+              except Exception as e:
+                  return {'host':host,'result':'transport_error','error_type':type(e).__name__}
+          def python_probes(context):
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  return list(pool.map(lambda h:tls(h,context),hosts+controls))
+          node_code = r"""
+          const tls=require('node:tls');
+          const hosts=JSON.parse(process.argv[1]);
+          Promise.all(hosts.map(host=>new Promise(resolve=>{
+           let done=false; const end=result=>{if(!done){done=true;resolve({host,result});s.destroy();}};
+           const s=tls.connect({host,port:443,servername:host,rejectUnauthorized:true},()=>end('accepted_tls'));
+           s.setTimeout(10000,()=>end('transport_error'));
+           s.on('error',e=>end(/CERT|ISSUER|VERIFY|SELF_SIGNED/.test(e.code||'')?'rejected_certificate':'transport_error'));
+          }))).then(rows=>console.log(JSON.stringify({node:process.version,openssl:process.versions.openssl,executable:process.execPath,rows})));
+          """
+          # Find the actual JavaScript action runtime, rather than trusting the action.yml label.
+          node_paths = []
+          for root in ['/home/runner/runners','/Users/runner/runners']:
+              node_paths += sorted(pathlib.Path(root).glob('*/externals/node24/bin/node'))
+          node_paths += [pathlib.Path('/__e/node24/bin/node'),pathlib.Path('/home/runner/actions-runner/externals/node24/bin/node')]
+          worker_executables=[]
+          for proc in pathlib.Path('/proc').glob('[0-9]*'):
+              try:
+                  if (proc/'comm').read_text().strip() in ('Runner.Worker','Runner.Listener'):
+                      executable=(proc/'exe').resolve()
+                      worker_executables.append(str(executable))
+                      node_paths.insert(0,executable.parent.parent/'externals/node24/bin/node')
+              except (OSError,PermissionError):
+                  pass
+          try:
+              for line in subprocess.check_output(['ps','-axo','comm='], text=True).splitlines():
+                  p=pathlib.Path(line.strip())
+                  if p.name == 'Runner.Worker' and p.is_absolute():
+                      node_paths.insert(0,p.parent.parent/'externals/node24/bin/node')
+          except (OSError,subprocess.CalledProcessError):
+              pass
+          node = next((p for p in node_paths if p.is_file()),None)
+          def node_probes(env):
+              if node is None:
+                  print(json.dumps({'runner_worker_executables':worker_executables,'node_candidates':[str(p) for p in node_paths]},sort_keys=True),flush=True)
+              assert node is not None, 'Actual action node24 binary was not found' 
+              return json.loads(subprocess.check_output([str(node),'-e',node_code,json.dumps(hosts+controls)],env=env,text=True,timeout=35))
+          def curl_probes(env):
+              def one(h):
+                  r=subprocess.run(['curl','--noproxy','*','--silent','--show-error','--head','--output',os.devnull,'--connect-timeout','8','--max-time','12','https://'+h+'/'],env=env,capture_output=True,text=True,timeout=15)
+                  return {'host':h,'result':'accepted_tls' if r.returncode==0 else ('rejected_certificate' if r.returncode==60 else 'transport_error'),'exit':r.returncode}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  return list(pool.map(one,hosts+controls))
+          def gate(rows):
+              assert len(rows)==18
+              assert all(r['result']=='rejected_certificate' for r in rows if r['host'] in hosts), 'Affected chain accepted or network inconclusive'
+              assert all(r['result']=='accepted_tls' for r in rows if r['host'] in controls), 'Normal TLS control failed'
+          if probe:
+              print(json.dumps({'phase':'raw_runner_before_scoped_changes','python':sys.version.split()[0],'openssl':ssl.OPENSSL_VERSION,'ca_paths':list(paths),'python_tls':python_probes(raw),'action_node':node_probes(raw_env),'curl_tls':curl_probes(raw_env)},sort_keys=True),flush=True)
+          # Remove only the two public trust anchors covering the compromised emSign chains.
+          # Preserve every other anchor. An empty directory prevents OpenSSL capath fallback.
+          out = pathlib.Path(os.environ['RUNNER_TEMP'])/'cobas-ci-trust'
+          out.mkdir(mode=0o700,parents=True,exist_ok=True)
+          empty = out/'empty'; empty.mkdir(exist_ok=True)
+          bundle = out/'roots.pem'
+          kept = {h:c for h,c in roots.items() if h not in bad}
+          bundle.write_text(''.join(ssl.DER_cert_to_PEM_cert(c) for c in kept.values()))
+          assert set(roots)-set(kept) <= bad and not (set(kept)&bad)
+          settings = {k:str(bundle) for k in ['SSL_CERT_FILE','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT']}
+          settings['SSL_CERT_DIR']=str(empty)
+          settings['GIT_SSL_CAPATH']=str(empty)
+          settings['CARGO_HTTP_CAINFO']=str(bundle)
+          # libcurl's compiled default CApath can override SSL_CERT_DIR. A job-scoped
+          # curlrc closes that fallback for normal curl calls; --disable callers are separate.
+          (out/'.curlrc').write_text('cacert = '+json.dumps(str(bundle))+'\ncapath = '+json.dumps(str(empty))+'\n')
+          settings['CURL_HOME']=str(out)
+          settings['HOMEBREW_CURLRC']=str(out/'.curlrc')
+          protected_env={**raw_env,**settings,'NODE_OPTIONS':'--use-openssl-ca'}
+          protected=ssl.create_default_context(cafile=str(bundle),capath=str(empty))
+          print(json.dumps({'phase':'scoped_ca_prepared','source_anchors':len(roots),'kept_anchors':len(kept),'removed_public_sha256':sorted(set(roots)-set(kept)),'bundle_sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),'actual_action_node':str(node) if node else None,'provider_boundary':'Runner .NET action downloads and host container pulls happen outside this shell; this does not attest them.'},sort_keys=True),flush=True)
+          if probe:
+              py=python_probes(protected); nd=node_probes(protected_env); cu=curl_probes(protected_env)
+              print(json.dumps({'phase':'scoped_runtime_acceptance','python_tls':py,'action_node':nd,'curl_tls':cu},sort_keys=True),flush=True)
+              gate(py); gate(nd['rows']); gate(cu)
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              for k,v in settings.items():
+                  f.write(f'{k}={v}\n')
+          # NODE_OPTIONS must be set directly in workflow env; GitHub forbids setting it via GITHUB_ENV.
+          CI_TRUST_PY
+
+      - name: Qualify actual pip session without changing runner packages
+        shell: bash
+        run: |
+          python3 - <<'CI_PIP_PY'
+          import hashlib, json, os, pathlib, subprocess, sys, urllib.request
+          assert sys.version_info >= (3,10), 'Pinned pip truststore qualification requires Python >= 3.10'
+          hosts = [f'{a}-{b}-emudhra.we-have-a-problem.com' for b in ['g3b','g3c','g3b-aaa','g3c-aaa'] for a in ['dv','ov','ev']] + ['dv-g3b-noct-emudhra.we-have-a-problem.com','dv-g3b-aaa-noct-emudhra.we-have-a-problem.com']
+          controls=['pypi.org','files.pythonhosted.org']
+          code=r"""
+          import concurrent.futures, hashlib, json, sys
+          try:
+           import pip
+           from pip._vendor import certifi
+           from pip._internal.commands import create_command
+          except ImportError:
+           print(json.dumps({'installed':False})); raise SystemExit(0)
+          hosts=json.loads(sys.argv[1])
+          def one(host):
+           cmd=create_command('index',isolated=True)
+           options,args=cmd.parse_args(['--no-cache-dir','--disable-pip-version-check','--no-input','--keyring-provider','disabled','--retries','0','--timeout','10','versions','cobas-trust-probe'])
+           session=cmd._build_session(options)
+           session.trust_env=False;session.auth=None;session.proxies={}
+           try:
+            with session.head('https://'+host+'/',allow_redirects=False,timeout=10,stream=True) as r:
+             return {'host':host,'result':'accepted_tls'}
+           except Exception as e:
+            return {'host':host,'result':'rejected_certificate' if any(marker in repr(e) for marker in ('CERTIFICATE_VERIFY_FAILED','SSLCertVerificationError','SSLVerificationError','certificate is blocked')) else 'transport_error','error_type':type(e).__name__,'error':str(e)[:300]}
+           finally:session.close()
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:rows=list(pool.map(one,hosts))
+          print(json.dumps({'installed':True,'pip':pip.__version__,'vendored_ca_sha256':hashlib.sha256(open(certifi.where(),'rb').read()).hexdigest(),'session':'pip default _build_session, truststore plus vendored certifi, no auth/proxy/cache/body','rows':rows},sort_keys=True))
+          """
+          raw_env={k:v for k,v in os.environ.items() if k not in ['SSL_CERT_FILE','SSL_CERT_DIR','CURL_CA_BUNDLE','REQUESTS_CA_BUNDLE','GIT_SSL_CAINFO','PIP_CERT','PYTHONPATH']}
+          r=subprocess.run([sys.executable,'-c',code,json.dumps(hosts+controls)],env=raw_env,capture_output=True,text=True,timeout=45)
+          assert r.returncode==0, 'Stock pip session could not be audited: '+r.stderr[-200:]
+          print(json.dumps({'phase':'raw_provider_pip_inventory','result':json.loads(r.stdout)},sort_keys=True),flush=True)
+          # Fetch with the already-qualified stdlib verifier, verify the exact official wheel, and
+          # import it from this job's temporary wheel. No system/runner pip installation is changed.
+          url='https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl'
+          expected='fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+          wheel=pathlib.Path(os.environ['RUNNER_TEMP'])/'pip-26.2.2-py3-none-any.whl'
+          with urllib.request.urlopen(url,timeout=30) as r:data=r.read(3000000)
+          assert hashlib.sha256(data).hexdigest()==expected, 'Official pip wheel checksum mismatch'
+          wheel.write_bytes(data)
+          env={**os.environ,'PYTHONPATH':str(wheel)}
+          r=subprocess.run([sys.executable,'-c',code,json.dumps(hosts+controls)],env=env,capture_output=True,text=True,timeout=45)
+          assert r.returncode==0, 'Fixed pip session audit failed: '+r.stderr[-200:]
+          result=json.loads(r.stdout)
+          print(json.dumps({'phase':'fixed_pip_default_session_acceptance','wheel_sha256':expected,'result':result},sort_keys=True),flush=True)
+          assert result['pip']=='26.2.2'
+          assert len(result['rows'])==16
+          assert all(x['result']=='rejected_certificate' for x in result['rows'] if x['host'] in hosts)
+          assert all(x['result']=='accepted_tls' for x in result['rows'] if x['host'] in controls)
+          CI_PIP_PY
+
